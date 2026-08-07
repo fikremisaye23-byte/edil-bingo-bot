@@ -326,6 +326,10 @@ async def deposit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _run_menu_action("deposit", update.message, update.effective_user, context)
 
 
+async def play_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _run_menu_action("play", update.message, update.effective_user, context)
+
+
 async def withdraw_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _run_menu_action("withdraw", update.message, update.effective_user, context)
 
@@ -421,7 +425,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parsed = parse_telebirr_sms(text)
         valid = (
             parsed is not None
-            and parsed["phone_last4"] == data.get("payToPhone", "")[-4:]
             and parsed["amount"] == float(data.get("amount", -1))
             and not used_deposit_ids_ref.child(parsed["txn_id"]).get()
         )
@@ -534,9 +537,23 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             wallet_ref.transaction(credit)
             await query.edit_message_text(f"✅ Approved deposit of {amount} coins for {record.get('name')}.")
+            try:
+                await context.bot.send_message(
+                    chat_id=int(user_id),
+                    text=f"✅ Deposit Success! {amount} ኮይን ወደ ዋሌትዎ ገብቷል።",
+                )
+            except Exception as e:
+                log.warning(f"Could not notify depositor {user_id} of approval: {e}")
         else:
             deposits_ref.child(key).update({"status": "rejected"})
             await query.edit_message_text(f"❌ Rejected deposit ({record.get('amount')} coins) for {record.get('name')}.")
+            try:
+                await context.bot.send_message(
+                    chat_id=int(record["by"]),
+                    text=f"❌ Deposit Reject. የ{record.get('amount')} ኮይን ተቀማጭ ገንዘብ ጥያቄዎ ውድቅ ሆኗል።",
+                )
+            except Exception as e:
+                log.warning(f"Could not notify depositor {record['by']} of rejection: {e}")
 
     elif kind == "withdrawal":
         record = withdrawals_ref.child(key).get()
@@ -664,6 +681,7 @@ def main():
     app.add_handler(CommandHandler("balance", balance_command))
     app.add_handler(CommandHandler("deposit", deposit_command))
     app.add_handler(CommandHandler("withdraw", withdraw_command))
+    app.add_handler(CommandHandler("play", play_command))
     app.add_handler(CallbackQueryHandler(menu_handler, pattern=r"^menu:"))
     app.add_handler(CallbackQueryHandler(deposit_payment_handler, pattern=r"^deppay:"))
     app.add_handler(CallbackQueryHandler(handle_button, pattern=r"^(approve|reject):"))
