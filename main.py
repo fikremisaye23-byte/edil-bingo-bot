@@ -503,56 +503,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
-# ---- Admin-only test balance (temporary QA tool) ----
-# Usage from the ADMIN account only:
-#   /testbalance <telegram_user_id> [amount]
-# It credits the user's Play Wallet and marks the amount as deposited
-# so the real-money stake/payout paths can be tested without a real deposit.
-# Remove this handler after multiplayer testing is complete.
-async def testbalance_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_CHAT_ID:
-        await update.message.reply_text("❌ Not authorized.")
-        return
-
-    args = context.args or []
-    if not args or not args[0].isdigit():
-        await update.message.reply_text(
-            "🧪 Test Balance\n\n"
-            "Usage: /testbalance USER_ID [AMOUNT]\n"
-            "Example: /testbalance 123456789 1000"
-        )
-        return
-
-    target_user_id = args[0]
-    amount = 1000
-    if len(args) >= 2:
-        try:
-            amount = int(args[1])
-        except ValueError:
-            await update.message.reply_text("❌ Amount must be a whole number.")
-            return
-
-    if amount <= 0:
-        await update.message.reply_text("❌ Amount must be greater than 0.")
-        return
-
-    wallet_ref = _wallet_ref(target_user_id)
-
-    def credit_test(current):
-        current = current or {"main": 0, "play": 0, "deposited": 0}
-        current["play"] = float(current.get("play", 0) or 0) + amount
-        current["deposited"] = float(current.get("deposited", 0) or 0) + amount
-        return current
-
-    wallet = wallet_ref.transaction(credit_test)
-    await update.message.reply_text(
-        f"🧪 Test balance added\n"
-        f"User ID: {target_user_id}\n"
-        f"Added to Play Wallet: {amount} ብር\n"
-        f"Play Wallet now: {wallet.get('play', 0)} ብር"
-    )
-
-
 # ---- Approve/Reject button handler (admin only) ----
 async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -732,7 +682,6 @@ def main():
     app.add_handler(CommandHandler("deposit", deposit_command))
     app.add_handler(CommandHandler("withdraw", withdraw_command))
     app.add_handler(CommandHandler("play", play_command))
-    app.add_handler(CommandHandler("testbalance", testbalance_command))
     app.add_handler(CallbackQueryHandler(menu_handler, pattern=r"^menu:"))
     app.add_handler(CallbackQueryHandler(deposit_payment_handler, pattern=r"^deppay:"))
     app.add_handler(CallbackQueryHandler(handle_button, pattern=r"^(approve|reject):"))
