@@ -528,7 +528,6 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user_id = str(record["by"])
             amount = record["amount"]
             wallet_ref = db.reference(f"users/{user_id}/wallet")
-            log.info(f"DEPOSIT DEBUG: approving deposit for user_id={user_id}, amount={amount}")
 
             def credit(current):
                 current = current or {"main": 0, "play": 0, "deposited": 0}
@@ -536,8 +535,7 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 current["deposited"] = current.get("deposited", 0) + amount
                 return current
 
-            result = wallet_ref.transaction(credit)
-            log.info(f"DEPOSIT DEBUG: wallet after transaction for user_id={user_id}: {result}")
+            wallet_ref.transaction(credit)
             await query.edit_message_text(f"✅ Approved deposit of {amount} coins for {record.get('name')}.")
             try:
                 await context.bot.send_message(
