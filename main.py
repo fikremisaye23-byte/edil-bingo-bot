@@ -330,6 +330,18 @@ async def play_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _run_menu_action("play", update.message, update.effective_user, context)
 
 
+async def instruction_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _run_menu_action("instruction", update.message, update.effective_user, context)
+
+
+async def contactsupport_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _run_menu_action("support", update.message, update.effective_user, context)
+
+
+async def invite_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _run_menu_action("invite", update.message, update.effective_user, context)
+
+
 async def withdraw_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _run_menu_action("withdraw", update.message, update.effective_user, context)
 
@@ -423,22 +435,39 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif flow == "deposit_sms":
         parsed = parse_telebirr_sms(text)
-        valid = (
+        format_valid = (
             parsed is not None
             and parsed["amount"] == float(data.get("amount", -1))
-            and not used_deposit_ids_ref.child(parsed["txn_id"]).get()
         )
 
-        if not valid:
+        if not format_valid:
             await update.message.reply_text(
                 "🚫 ጥያቄው አልተሳካም። እባክዎ ስልክዎ ላይ የገባውን ትክክለኛ ሚሴጅ (SMS) ኮፒ አድርገው ይላኩ፡፡\n\n"
                 f"❓ለድጋፍ @{SUPPORT_USERNAME} ላይ ይፃፉልን"
             )
             return
 
-        # Reserve this transaction ID immediately so it can't be reused
-        # while the deposit is still pending approval.
-        used_deposit_ids_ref.child(parsed["txn_id"]).set(True)
+        # Atomically check-and-reserve this transaction ID in a single Firebase
+        # transaction, so two near-simultaneous submissions of the same SMS
+        # (whether from this player double-tapping or two different players)
+        # can never both slip through -- only whichever one wins the race gets
+        # reserved, and the loser is told it's already used.
+        already_used_holder = {"already_used": False}
+
+        def reserve(current):
+            if current:
+                already_used_holder["already_used"] = True
+                return current  # no-op -- leave the existing reservation as-is
+            return True
+
+        used_deposit_ids_ref.child(parsed["txn_id"]).transaction(reserve)
+
+        if already_used_holder["already_used"]:
+            await update.message.reply_text(
+                "🚫 ጥያቄው አልተሳካም። እባክዎ ስልክዎ ላይ የገባውን ትክክለኛ ሚሴጅ (SMS) ኮፒ አድርገው ይላኩ፡፡\n\n"
+                f"❓ለድጋፍ @{SUPPORT_USERNAME} ላይ ይፃፉልን"
+            )
+            return
 
         data["smsText"] = text
         key = deposits_ref.push({
@@ -699,6 +728,9 @@ def main():
     app.add_handler(CommandHandler("deposit", deposit_command))
     app.add_handler(CommandHandler("withdraw", withdraw_command))
     app.add_handler(CommandHandler("play", play_command))
+    app.add_handler(CommandHandler("instruction", instruction_command))
+    app.add_handler(CommandHandler("contactsupport", contactsupport_command))
+    app.add_handler(CommandHandler("invite", invite_command))
     app.add_handler(CallbackQueryHandler(menu_handler, pattern=r"^menu:"))
     app.add_handler(CallbackQueryHandler(deposit_payment_handler, pattern=r"^deppay:"))
     app.add_handler(CallbackQueryHandler(handle_button, pattern=r"^(approve|reject):"))
