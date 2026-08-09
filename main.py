@@ -524,7 +524,6 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         if action == "approve":
-            deposits_ref.child(key).update({"status": "approved"})
             user_id = str(record["by"])
             amount = record["amount"]
             wallet_ref = db.reference(f"users/{user_id}/wallet")
@@ -536,18 +535,24 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return current
 
             try:
+                # Credit the wallet FIRST. Only mark the deposit "approved" once
+                # this has actually succeeded -- if we mark it approved first and
+                # the credit call then fails/gets interrupted (e.g. a cold-start
+                # timeout on the free Render tier), the deposit is stuck showing
+                # "approved" forever with no way to safely retry, and the money
+                # looks like it vanished. Doing it in this order means a failure
+                # here leaves the deposit "pending" so pressing Approve again is
+                # always safe.
                 wallet_ref.transaction(credit)
             except Exception as e:
-                # Don't fail silently -- the status is already "approved", so if the
-                # wallet credit itself blows up we need to know immediately instead
-                # of discovering it later as "money never arrived".
                 log.exception(f"Wallet credit FAILED for deposit {key} (user {user_id}, amount {amount})")
                 await query.edit_message_text(
-                    f"⚠️ Marked approved, but crediting the wallet FAILED for "
-                    f"{record.get('name')} ({amount} coins).\nError: {e}\n\n"
-                    f"Please credit this manually and check the logs."
+                    f"⚠️ Wallet credit FAILED for {record.get('name')} ({amount} coins).\n"
+                    f"Error: {e}\n\nDeposit is still PENDING -- press Approve again to retry."
                 )
                 return
+
+            deposits_ref.child(key).update({"status": "approved"})
             await query.edit_message_text(f"✅ Approved deposit of {amount} coins for {record.get('name')}.")
             try:
                 await context.bot.send_message(
