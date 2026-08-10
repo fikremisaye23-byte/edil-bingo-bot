@@ -110,21 +110,46 @@ def get_next_telebirr_number():
 # Returns a dict with amount / phone_last4 / txn_id, or None if the text
 # doesn't look like a real Telebirr SMS at all.
 def parse_telebirr_sms(text):
-    amount_match = re.search(r"\)\s*([\d,]+(?:\.\d+)?)\s*ብር\s*በ", text)
-    phone_match = re.search(r"\(251\d\*+(\d{4})\)", text)
-    txn_match = re.search(r"ቁጥርዎ\s+(\S+)\s+ነዉ", text)
+    # Amount: collect EVERY "X ብር" figure in the message (not just the first).
+    # Real Telebirr SMS can mention more than one monetary amount (e.g. a
+    # service fee alongside the actual transferred amount) -- returning every
+    # candidate lets the caller pick the one that actually matches what the
+    # user said they sent, instead of blindly trusting whichever number
+    # happens to appear first.
+    amount_matches = re.findall(r"([\d,]+(?:\.\d+)?)\s*ብር", text)
+    # Phone (last 4 digits of the masked sender number): informational only,
+    # not required for the deposit to be considered valid -- we already
+    # verify the depositing user via their Telegram account, so a missing or
+    # differently-formatted phone snippet should not block an otherwise valid
+    # deposit.
+    phone_match = re.search(r"\(?251\d\*+(\d{2,4})\)?", text)
+    # Transaction ID: accept both common Amharic spellings/diacritics of
+    # "ነው" ("ነዉ"/"ነው") since real messages aren't guaranteed to use the one
+    # exact variant we happened to hardcode, and allow slightly looser
+    # spacing around "ቁጥርዎ".
+    txn_match = re.search(r"ቁጥርዎ\s*(\S+)\s*ነ[ዉው]", text)
+    if not txn_match:
+        # Fallback: some message variants phrase it differently -- try to
+        # grab any long alphanumeric token that looks like a transaction
+        # reference (Telebirr references are typically 8-12 uppercase
+        # letters/digits).
+        txn_match = re.search(r"\b([A-Z0-9]{8,14})\b", text)
 
-    if not (amount_match and phone_match and txn_match):
+    if not (amount_matches and txn_match):
         return None
 
-    try:
-        amount = float(amount_match.group(1).replace(",", ""))
-    except ValueError:
+    amounts = []
+    for raw in amount_matches:
+        try:
+            amounts.append(float(raw.replace(",", "")))
+        except ValueError:
+            continue
+    if not amounts:
         return None
 
     return {
-        "amount": amount,
-        "phone_last4": phone_match.group(1),
+        "amounts": amounts,
+        "phone_last4": phone_match.group(1) if phone_match else "",
         "txn_id": txn_match.group(1),
     }
 
@@ -435,14 +460,38 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif flow == "deposit_sms":
         parsed = parse_telebirr_sms(text)
-        format_valid = (
-            parsed is not None
-            and parsed["amount"] == float(data.get("amount", -1))
-        )
 
-        if not format_valid:
+        if parsed is None:
+            log.info(f"Deposit SMS unparseable for user {user_id}: could not extract amount+txn_id from text")
             await update.message.reply_text(
-                "🚫 ጥያቄው አልተሳካም። እባክዎ ስልክዎ ላይ የገባውን ትክክለኛ ሚሴጅ (SMS) ኮፒ አድርገው ይላኩ፡፡\n\n"
+                "🚫 ኤስኤምኤሱ ሊነበብ አልቻለም። እባክዎ ስልክዎ ላይ የገባውን ትክክለኛ ሚሴጅ (SMS) ሙሉ በሙሉ ኮፒ አድርገው ይላኩ፡፡\n\n"
+                f"❓ለድጋፍ @{SUPPORT_USERNAME} ላይ ይፃፉልን"
+            )
+            return
+
+        # Validate the amount by checking ALL "X ብር" figures found in the
+        # message against what the user said they were sending -- not just
+        # the first one. Real Telebirr messages sometimes mention more than
+        # one amount (e.g. a service fee alongside the actual transfer), and
+        # blindly trusting the first match was rejecting genuinely valid
+        # deposits when it happened to grab the wrong figure. If ANY
+        # candidate matches what the user stated, we know we found the real
+        # transferred amount.
+        stated_amount = data.get("amount")
+        matched_amount = None
+        if stated_amount is not None:
+            for candidate in parsed["amounts"]:
+                if abs(candidate - float(stated_amount)) <= 0.01:
+                    matched_amount = candidate
+                    break
+
+        if matched_amount is None:
+            log.info(
+                f"Deposit SMS amount mismatch for user {user_id}: "
+                f"stated={stated_amount}, found candidates={parsed['amounts']}, txn={parsed['txn_id']}"
+            )
+            await update.message.reply_text(
+                "🚫 SMS ላይ ያለው የገንዘብ መጠን ካስገቡት መጠን ጋር አይመሳሰልም። እባክዎ ትክክለኛውን ሚሴጅ (SMS) ያረጋግጡ እና እንደገና ይላኩ፡፡\n\n"
                 f"❓ለድጋፍ @{SUPPORT_USERNAME} ላይ ይፃፉልን"
             )
             return
@@ -463,17 +512,19 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         used_deposit_ids_ref.child(parsed["txn_id"]).transaction(reserve)
 
         if already_used_holder["already_used"]:
+            log.info(f"Deposit SMS duplicate for user {user_id}: txn_id={parsed['txn_id']} already reserved")
             await update.message.reply_text(
-                "🚫 ጥያቄው አልተሳካም። እባክዎ ስልክዎ ላይ የገባውን ትክክለኛ ሚሴጅ (SMS) ኮፒ አድርገው ይላኩ፡፡\n\n"
+                "🚫 ይህ የደረሰኝ ቁጥር (transaction ID) ቀድሞ ጥቅም ላይ ውሏል። እያንዳንዱ ደረሰኝ አንድ ጊዜ ብቻ ጥቅም ላይ ሊውል ይችላል፡፡\n\n"
                 f"❓ለድጋፍ @{SUPPORT_USERNAME} ላይ ይፃፉልን"
             )
             return
 
+        sms_amount = matched_amount
         data["smsText"] = text
         key = deposits_ref.push({
             "by": user_id,
             "name": data.get("name", "Player"),
-            "amount": data["amount"],
+            "amount": sms_amount,
             "phone": data.get("payToPhone", ""),
             "smsText": text,
             "paidTo": data.get("payToPhone", ""),
@@ -483,7 +534,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["flow"] = None
         context.user_data["flow_data"] = {}
         await update.message.reply_text(
-            f"⏳ Deposit request of {data['amount']} coins submitted (ID {key}). "
+            f"⏳ Deposit request of {sms_amount} coins submitted (ID {key}). "
             f"Waiting for admin approval."
         )
 
@@ -544,12 +595,29 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     action, kind, key = query.data.split(":", 2)  # e.g. "approve:deposit:ABC123"
 
     if kind == "deposit":
-        record = deposits_ref.child(key).get()
+        # Atomically claim this deposit for processing: only one concurrent
+        # Approve/Reject click (or duplicate Telegram callback) can ever win
+        # this transaction. Whoever loses the race gets told it's already
+        # being handled and does nothing further -- this is what actually
+        # prevents a double-tap from crediting the wallet twice.
+        claim_holder = {"record": None, "already_claimed": False}
+
+        def claim(current):
+            if not current or current.get("status") != "pending":
+                claim_holder["already_claimed"] = True
+                return current  # no-op -- someone already claimed/handled it
+            current = dict(current)
+            current["status"] = "processing"
+            return current
+
+        result = deposits_ref.child(key).transaction(claim)
+        record = result.snapshot.val() if hasattr(result, "snapshot") else deposits_ref.child(key).get()
+
         if not record:
             await query.edit_message_text("⚠️ Record not found (maybe already handled).")
             return
-        if record.get("status") != "pending":
-            await query.edit_message_text(f"ℹ️ Already {record.get('status')}.")
+        if claim_holder["already_claimed"]:
+            await query.edit_message_text(f"ℹ️ Already {record.get('status')} (or already being processed).")
             return
 
         if action == "approve":
@@ -570,11 +638,13 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 # timeout on the free Render tier), the deposit is stuck showing
                 # "approved" forever with no way to safely retry, and the money
                 # looks like it vanished. Doing it in this order means a failure
-                # here leaves the deposit "pending" so pressing Approve again is
-                # always safe.
+                # here leaves it safely retryable.
                 wallet_ref.transaction(credit)
             except Exception as e:
                 log.exception(f"Wallet credit FAILED for deposit {key} (user {user_id}, amount {amount})")
+                # Release our claim back to "pending" so Approve can be safely
+                # pressed again -- we never leave it stuck on "processing".
+                deposits_ref.child(key).update({"status": "pending"})
                 await query.edit_message_text(
                     f"⚠️ Wallet credit FAILED for {record.get('name')} ({amount} coins).\n"
                     f"Error: {e}\n\nDeposit is still PENDING -- press Approve again to retry."
