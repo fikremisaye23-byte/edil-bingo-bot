@@ -36,6 +36,7 @@ from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    CopyTextButton,
     WebAppInfo,
     KeyboardButton,
     ReplyKeyboardMarkup,
@@ -483,8 +484,7 @@ async def withdraw_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def deposit_payment_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    parts = query.data.split(":", 2)
-    choice = parts[1]
+    choice = query.data.split(":", 1)[1]
 
     if choice == "cancel":
         context.user_data["flow"] = None
@@ -494,18 +494,6 @@ async def deposit_payment_handler(update: Update, context: ContextTypes.DEFAULT_
         )
         return
 
-    # Copy buttons return the exact number as a separate message so the user
-    # can long-press it and copy it easily on Telegram mobile.
-    if choice == "copy" and len(parts) == 3:
-        try:
-            idx = int(parts[2])
-            number_obj = TELEBIRR_NUMBERS[idx]
-        except (ValueError, IndexError):
-            await query.message.reply_text("❌ የTelebirr ቁጥሩ አልተገኘም።")
-            return
-        await query.message.reply_text(f"📋 {number_obj['phone']}")
-        return
-
     data = context.user_data.setdefault("flow_data", {})
     amount = data.get("amount")
     number_obj = get_next_telebirr_number()
@@ -513,22 +501,26 @@ async def deposit_payment_handler(update: Update, context: ContextTypes.DEFAULT_
     data["payToName"] = number_obj["name"]
     context.user_data["flow"] = "deposit_sms"
 
-    keyboard_rows = [
-        [InlineKeyboardButton(f"📋 {item['phone']}", callback_data=f"deppay:copy:{i}")]
-        for i, item in enumerate(TELEBIRR_NUMBERS)
-    ]
-    keyboard_rows.append([InlineKeyboardButton("❌ Cancel", callback_data="deppay:cancel")])
+    # Telegram's native CopyTextButton makes the receiving phone number itself
+    # the copy button. The user can tap the displayed number and paste it into
+    # Telebirr without a separate copy handler or extra message.
+    phone_button = InlineKeyboardButton(
+        number_obj["phone"],
+        copy_text=CopyTextButton(number_obj["phone"]),
+    )
+    keyboard = InlineKeyboardMarkup([
+        [phone_button],
+        [InlineKeyboardButton("❌ Cancel", callback_data="deppay:cancel")],
+    ])
 
     await query.message.reply_text(
         f"የሚያጋጥማቹ የክፍያ ችግር:@{SUPPORT_USERNAME} ላይ ፃፉልን።\n\n"
-        f"1. ከታች ካሉት የቴሌብር አካውንቶች በአንዱ {amount} ብር ያስገቡ።\n\n"
-        f"የቴሌብር መቀበያ ቁጥሮች:\n"
-        f"• {TELEBIRR_NUMBERS[0]['phone']}\n"
-        f"• {TELEBIRR_NUMBERS[1]['phone']}\n"
-        f"• {TELEBIRR_NUMBERS[2]['phone']}\n\n"
-        f"📋 ቁጥሩን ለመቅዳት ከታች ያለውን button ይጫኑ።\n\n"
-        f"2. የከፈሉበትን የTelebirr ማረጋገጫ SMS copy በማድረግ እዚህ ላይ Paste አድርገው ይላኩ👇👇👇",
-        reply_markup=InlineKeyboardMarkup(keyboard_rows),
+        f"1. ከታች ባለው የቴሌብር አካውንት {amount} ብር ያስገቡ\n"
+        f"Phone: {number_obj['phone']}\n\n"
+        f"📋 ስልክ ቁጥሩን ለመቅዳት ቁጥሩን ይጫኑ።\n\n"
+        f"2. የከፈሉበትን አጭር የጹሁፍ መልዕክት(message) copy በማድረግ እዚ ላይ Paste "
+        f"አድርገው ያስገቡና ይላኩት👇👇👇",
+        reply_markup=keyboard,
     )
 
 
