@@ -110,18 +110,54 @@ def get_next_telebirr_number():
 # Returns a dict with amount / phone_last4 / txn_id, or None if the text
 # doesn't look like a real Telebirr SMS at all.
 def parse_telebirr_sms(text):
-    # Keep the parser tolerant of harmless SMS formatting differences while
-    # still requiring the characteristic Telebirr transaction/reference ID.
+    """Parse a genuine Telebirr transfer confirmation SMS.
+
+    The parser is intentionally tolerant of harmless formatting differences,
+    but it still requires Telebirr-specific wording, a masked recipient phone,
+    an amount in birr, and a transaction/reference ID.
+    """
     if not text or not isinstance(text, str):
         return None
 
     norm = " ".join(text.split())
+    lowered = norm.lower()
 
-    amount_match = re.search(r"([\d,]+(?:\.\d+)?)\s*ብር", norm)
-    phone_match = re.search(r"\(?251\d\*+(\d{4})\)?", norm)
-    txn_match = re.search(r"(?:ቁጥርዎ?|የሂሳብ እንቅስቃሴ ቁጥር|Ref(?:erence)?|Txn(?:ID)?)\s*[:\-]?\s*([A-Z0-9]{8,20})", norm, re.IGNORECASE)
+    # Require Telebirr-style transfer wording so arbitrary text is not accepted.
+    has_telebirr_context = (
+        "ብር" in norm
+        and ("ልከዋል" in norm or "ልኳል" in norm or "transfer" in lowered or "sent" in lowered)
+        and ("ቁጥር" in norm or "ref" in lowered or "transaction" in lowered)
+    )
+    if not has_telebirr_context:
+        return None
 
-    if not (amount_match and txn_match):
+    # Example: (2519****3559), while allowing spaces around punctuation.
+    phone_match = re.search(r"\(\s*251\d\s*\*{2,}\s*(\d{4})\s*\)", norm)
+    if not phone_match:
+        phone_match = re.search(r"251\d\s*\*{2,}\s*(\d{4})", norm)
+    if not phone_match:
+        return None
+
+    # Amount normally appears immediately before "ብር"; allow 10, 10.00, 1,000.00.
+    amount_match = re.search(r"([0-9]{1,3}(?:,[0-9]{3})*(?:\.\d+)?|[0-9]+(?:\.\d+)?)\s*ብር", norm)
+    if not amount_match:
+        amount_match = re.search(r"([0-9]{1,3}(?:,[0-9]{3})*(?:\.\d+)?|[0-9]+(?:\.\d+)?)\s*(?:ETB)\b", norm, re.IGNORECASE)
+    if not amount_match:
+        return None
+
+    # Prefer the transaction token following the Amharic transaction-number wording.
+    txn_match = re.search(
+        r"ቁጥር(?:ዎ|ው)?\s*[:\-]?\s*([A-Za-z0-9]{8,24})",
+        norm,
+        re.IGNORECASE,
+    )
+    if not txn_match:
+        txn_match = re.search(
+            r"\b(?:transaction(?:\s+id)?|txn(?:\s+id)?|ref(?:erence)?)\s*[:\-]?\s*([A-Za-z0-9]{8,24})\b",
+            norm,
+            re.IGNORECASE,
+        )
+    if not txn_match:
         return None
 
     try:
@@ -129,145 +165,53 @@ def parse_telebirr_sms(text):
     except ValueError:
         return None
 
+    txn_id = txn_match.group(1).strip().upper()
+    if not re.fullmatch(r"[A-Z0-9]{8,24}", txn_id):
+        return None
+
     return {
         "amount": amount,
-        "phone_last4": phone_match.group(1) if phone_match else None,
-        "txn_id": txn_match.group(1).upper(),
+        "phone_last4": phone_match.group(1),
+        "txn_id": txn_id,
     }
 
 
-def _verify_telebirr_receipt(txn_id, expected_amount, expected_phone):
-    """Verify the public Telebirr receipt for the current Deposit only.
+def _verify_telebirr_receipt(txn_id, amount):
+    """Verify a Telebirr transaction through the official receipt URL.
 
-    The receipt is read from the official public receipt URL and the labelled
-    receipt fields are checked: receipt/reference number, settled amount,
-    successful transaction status, and credited-party Telebirr number.
+    No new dependency is required. The transaction ID and amount must both be
+    visible in the returned receipt; otherwise verification fails closed.
     """
-    import html as _html
-    from urllib.request import Request, urlopen
-
-    txn_id = str(txn_id or "").strip().upper()
-    if not re.fullmatch(r"[A-Z0-9]{8,20}", txn_id, re.IGNORECASE):
-        return False
+    import urllib.request
+    import urllib.error
 
     url = f"https://transactioninfo.ethiotelecom.et/receipt/{txn_id}"
     try:
-        request = Request(
+        request = urllib.request.Request(
             url,
             headers={"User-Agent": "Mozilla/5.0"},
             method="GET",
         )
-        with urlopen(request, timeout=15) as response:
-            if getattr(response, "status", 200) != 200:
+        with urllib.request.urlopen(request, timeout=12) as response:
+            if response.status != 200:
                 return False
-            raw_html = response.read().decode("utf-8", "ignore")
-    except Exception as e:
-        log.warning("Telebirr receipt verification failed for %s: %s", txn_id, e)
+            body = response.read().decode("utf-8", errors="ignore")
+    except (urllib.error.URLError, TimeoutError, OSError):
         return False
 
-    # Telebirr receipts are table-based. Read the value following each known
-    # label instead of depending on one exact HTML layout/spacing.
-    td_values = re.findall(r"<td\b[^>]*>(.*?)</td>", raw_html, flags=re.IGNORECASE | re.DOTALL)
-    values = []
-    for item in td_values:
-        item = re.sub(r"<br\s*/?>", " ", item, flags=re.IGNORECASE)
-        item = re.sub(r"<[^>]+>", " ", item)
-        item = _html.unescape(item)
-        item = " ".join(item.split()).strip()
-        values.append(item)
-
-    compact_values = [re.sub(r"\s+", "", v).lower() for v in values]
-
-    def value_after(labels):
-        labels = {re.sub(r"\s+", "", x).lower() for x in labels}
-        for i, value in enumerate(compact_values):
-            if value in labels and i + 1 < len(values):
-                return values[i + 1].strip()
-        return None
-
-    receipt_no = value_after([
-        "የክፍያቁጥር/receiptno.",
-        "የክፍያቁጥር/receiptno",
-    ])
-    settled_amount = value_after([
-        "የተከፈለውመጠን/settledamount",
-        "settledamount",
-    ])
-    status = value_after([
-        "የክፍያውሁኔታ/transactionstatus",
-        "transactionstatus",
-    ])
-    credited_account = value_after([
-        "የገንዘብተቀባይቴሌብርቁ./creditedpartyaccountno",
-        "creditedpartyaccountno",
-    ])
-
-    # Some receipt layouts place a value one extra table cell away for the
-    # amount/status/account fields. If the direct value is absent, use the
-    # normalized receipt text as a conservative fallback.
-    receipt_text = " ".join(values)
-    compact = re.sub(r"\s+", "", receipt_text).lower()
-
-    if receipt_no:
-        if re.sub(r"\s+", "", receipt_no).upper() != txn_id:
-            return False
-    elif txn_id.lower() not in compact:
+    compact = " ".join(body.split()).lower()
+    if txn_id.lower() not in compact:
         return False
 
-    amount_text = settled_amount
-    if not amount_text:
-        amount_match = re.search(
-            r"(?:የተከፈለውመጠን/settledamount|settledamount)\s*[:\-]?\s*([\d,]+(?:\.\d+)?)",
-            compact,
-            re.IGNORECASE,
-        )
-        if not amount_match:
-            return False
-        amount_text = amount_match.group(1)
-
-    amount_match = re.search(r"[\d,]+(?:\.\d+)?", amount_text)
-    if not amount_match:
-        return False
-    try:
-        receipt_amount = float(amount_match.group(0).replace(",", ""))
-    except ValueError:
-        return False
-    if abs(receipt_amount - float(expected_amount)) > 0.000001:
-        return False
-
-    status_text = re.sub(r"\s+", "", status or "").lower()
-    if not status_text:
-        status_text = compact
-    if not re.search(
-        r"(?:success|successful|completed|successfultransaction|ተሳክቷል|ተጠናቋል)",
-        status_text,
-        re.IGNORECASE,
-    ):
-        return False
-
-    expected_last4 = re.sub(r"\D", "", str(expected_phone or ""))[-4:]
-    if not expected_last4:
-        return False
-
-    account_text = credited_account
-    if not account_text:
-        account_match = re.search(
-            r"(?:የገንዘብተቀባይቴሌብርቁ\./creditedpartyaccountno)"
-            r"\s*[:\-]?\s*([0-9*]+)",
-            compact,
-            re.IGNORECASE,
-        )
-        if account_match:
-            account_text = account_match.group(1)
-
-    if not account_text:
-        return False
-
-    account_digits = re.sub(r"\D", "", account_text)
-    if account_digits[-4:] != expected_last4:
-        return False
-
-    return True
+    amount_texts = {
+        str(amount),
+        f"{amount:.2f}",
+        f"{amount:.2f}".replace(".", ","),
+    }
+    return any(
+        re.search(rf"(?<![0-9]){re.escape(value)}\s*(?:ብር|etb)\b", compact, re.IGNORECASE)
+        for value in amount_texts
+    )
 
 
 INSTRUCTIONS_TEXT = """🃏 መጫወቻ ካርድ
@@ -568,91 +512,89 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if parsed is None:
             await update.message.reply_text(
-                "🚫 የTelebirr SMS መረጃው አልተረጋገጠም። እባክዎ ከTelebirr የመጣውን ትክክለኛ SMS ብቻ ይላኩ።\n\n"
-                f"❓ለድጋፍ @{SUPPORT_USERNAME} ላይ ይፃፉልን"
+                "🚫 የTelebirr SMS መልዕክቱ ትክክለኛ አይመስልም።\n\n"
+                f"❓ ለድጋፍ @{SUPPORT_USERNAME} ላይ ይፃፉልን።"
             )
             return
 
+        # The amount in the SMS must exactly match the amount requested.
         if abs(parsed["amount"] - requested_amount) > 0.000001:
             await update.message.reply_text(
-                f"🚫 የTelebirr SMS መጠን ({parsed['amount']:g} ETB) ከጠየቁት {requested_amount:g} ETB ጋር አይመሳሰልም።"
+                f"🚫 የTelebirr SMS መጠን ({parsed['amount']:g} ETB) "
+                f"ከጠየቁት ({requested_amount:g} ETB) ጋር አይመሳሰልም።"
+            )
+            return
+
+        # The SMS recipient must match the receiving number assigned to this deposit.
+        assigned_phone = str(data.get("payToPhone", ""))
+        if assigned_phone and parsed["phone_last4"] != assigned_phone[-4:]:
+            await update.message.reply_text(
+                "🚫 ይህ የTelebirr SMS የተመደበልዎትን የመቀበያ ቁጥር አልያዘም። "
+                "እባክዎ ትክክለኛውን SMS ይላኩ።"
             )
             return
 
         txn_id = parsed["txn_id"]
+
+        # Never credit a Telebirr transaction/reference more than once.
         if used_deposit_ids_ref.child(txn_id).get():
             await update.message.reply_text(
-                "❌ ይህ Transaction ID ከዚህ በፊት ጥቅም ላይ ውሏል። ሁለት ጊዜ ሊከፈል አይችልም።"
+                "❌ ይህ የግብይት ቁጥር ከዚህ በፊት ተጠቅመዋል። "
+                "እንደገና ክሬዲት ማድረግ አይቻልም።"
             )
             return
 
-        # Verify the transaction against the public Telebirr receipt before
-        # reserving the ID or changing the user's wallet.
-        receipt_ok = await asyncio.to_thread(
-            _verify_telebirr_receipt,
-            txn_id,
-            requested_amount,
-            data.get("payToPhone", ""),
-        )
-        if not receipt_ok:
+        # Verify the transaction against the official Telebirr receipt endpoint.
+        if not _verify_telebirr_receipt(txn_id, parsed["amount"]):
             await update.message.reply_text(
-                "🚫 የTelebirr transaction receipt ማረጋገጥ አልተቻለም።\n"
-                "Transaction ID, amount እና የተላከበት የTelebirr ቁጥር እንደሚመሳሰሉ ያረጋግጡ።\n\n"
-                f"❓ለድጋፍ @{SUPPORT_USERNAME} ላይ ይፃፉልን"
+                "🚫 የTelebirr ግብይቱን በOfficial receipt ላይ ማረጋገጥ አልተቻለም።\n\n"
+                "እባክዎ ከTelebirr የመጣውን ትክክለኛ SMS ይላኩ።"
             )
             return
 
-        # Reserve the transaction ID atomically so the same receipt cannot be
-        # credited twice even if two submissions arrive almost simultaneously.
-        def claim_transaction(current):
-            return True if current is None else current
+        # Reserve the transaction ID before crediting the wallet.
+        used_deposit_ids_ref.child(txn_id).set(True)
 
-        claimed = used_deposit_ids_ref.child(txn_id).transaction(claim_transaction)
-        if claimed is not True:
-            await update.message.reply_text(
-                "❌ ይህ Transaction ID ከዚህ በፊት ጥቅም ላይ ውሏል። ሁለት ጊዜ ሊከፈል አይችልም።"
-            )
-            return
-
+        amount = parsed["amount"]
         data["smsText"] = text
-        amount = int(requested_amount) if requested_amount.is_integer() else requested_amount
 
-        # Preserve the existing wallet behavior used by the admin approval
-        # path: deposits increase Play Wallet and deposited total.
+        key = deposits_ref.push({
+            "by": user_id,
+            "name": data.get("name", "Player"),
+            "amount": int(amount) if amount.is_integer() else amount,
+            "phone": assigned_phone,
+            "smsText": text,
+            "paidTo": assigned_phone,
+            "txnId": txn_id,
+            "status": "approved",
+        }).key
+
+        # Preserve the existing deposit wallet behavior used by admin approval:
+        # deposit credits Play Wallet and deposited, without changing wallet structure.
         wallet_ref = _wallet_ref(user_id)
 
         def credit(current):
             current = current or {"main": 0, "play": 0, "deposited": 0}
-            current["play"] = current.get("play", 0) + requested_amount
-            current["deposited"] = current.get("deposited", 0) + requested_amount
+            current["play"] = current.get("play", 0) + amount
+            current["deposited"] = current.get("deposited", 0) + amount
             return current
 
         try:
             wallet_ref.transaction(credit)
-        except Exception as e:
+        except Exception:
             used_deposit_ids_ref.child(txn_id).delete()
-            log.warning("Wallet credit failed for deposit %s: %s", txn_id, e)
+            deposits_ref.child(key).update({"status": "failed"})
             await update.message.reply_text(
-                "🚫 የWallet ክሬዲት አልተሳካም። ገንዘቡ እንዳይደገም ግብይቱ አልተፈቀደም። እባክዎ ድጋፍ ያግኙ።"
+                "🚫 የWallet ክሬዲት ማድረግ አልተሳካም። እባክዎ ደግመው ይሞክሩ።"
             )
             return
 
-        deposits_ref.push({
-            "by": user_id,
-            "name": data.get("name", "Player"),
-            "amount": amount,
-            "phone": data.get("payToPhone", ""),
-            "smsText": text,
-            "paidTo": data.get("payToPhone", ""),
-            "txnId": txn_id,
-            "receiptUrl": f"https://transactioninfo.ethiotelecom.et/receipt/{txn_id}",
-            "status": "approved",
-        })
-
         context.user_data["flow"] = None
         context.user_data["flow_data"] = {}
+
+        display_amount = int(amount) if amount.is_integer() else amount
         await update.message.reply_text(
-            f"✅ Your deposit of {amount} ETB is Approved.\n"
+            f"✅ Your deposit of {display_amount} ETB is Approved.\n"
             f"🧾 Ref: {txn_id}"
         )
 
