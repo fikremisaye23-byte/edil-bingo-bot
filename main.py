@@ -110,48 +110,164 @@ def get_next_telebirr_number():
 # Returns a dict with amount / phone_last4 / txn_id, or None if the text
 # doesn't look like a real Telebirr SMS at all.
 def parse_telebirr_sms(text):
-    # Amount: collect EVERY "X ብር" figure in the message (not just the first).
-    # Real Telebirr SMS can mention more than one monetary amount (e.g. a
-    # service fee alongside the actual transferred amount) -- returning every
-    # candidate lets the caller pick the one that actually matches what the
-    # user said they sent, instead of blindly trusting whichever number
-    # happens to appear first.
-    amount_matches = re.findall(r"([\d,]+(?:\.\d+)?)\s*ብር", text)
-    # Phone (last 4 digits of the masked sender number): informational only,
-    # not required for the deposit to be considered valid -- we already
-    # verify the depositing user via their Telegram account, so a missing or
-    # differently-formatted phone snippet should not block an otherwise valid
-    # deposit.
-    phone_match = re.search(r"\(?251\d\*+(\d{2,4})\)?", text)
-    # Transaction ID: accept both common Amharic spellings/diacritics of
-    # "ነው" ("ነዉ"/"ነው") since real messages aren't guaranteed to use the one
-    # exact variant we happened to hardcode, and allow slightly looser
-    # spacing around "ቁጥርዎ".
-    txn_match = re.search(r"ቁጥርዎ\s*(\S+)\s*ነ[ዉው]", text)
-    if not txn_match:
-        # Fallback: some message variants phrase it differently -- try to
-        # grab any long alphanumeric token that looks like a transaction
-        # reference (Telebirr references are typically 8-12 uppercase
-        # letters/digits).
-        txn_match = re.search(r"\b([A-Z0-9]{8,14})\b", text)
-
-    if not (amount_matches and txn_match):
+    # Keep the parser tolerant of harmless SMS formatting differences while
+    # still requiring the characteristic Telebirr transaction/reference ID.
+    if not text or not isinstance(text, str):
         return None
 
-    amounts = []
-    for raw in amount_matches:
-        try:
-            amounts.append(float(raw.replace(",", "")))
-        except ValueError:
-            continue
-    if not amounts:
+    norm = " ".join(text.split())
+
+    amount_match = re.search(r"([\d,]+(?:\.\d+)?)\s*ብር", norm)
+    phone_match = re.search(r"\(?251\d\*+(\d{4})\)?", norm)
+    txn_match = re.search(r"(?:ቁጥርዎ?|የሂሳብ እንቅስቃሴ ቁጥር|Ref(?:erence)?|Txn(?:ID)?)\s*[:\-]?\s*([A-Z0-9]{8,20})", norm, re.IGNORECASE)
+
+    if not (amount_match and txn_match):
+        return None
+
+    try:
+        amount = float(amount_match.group(1).replace(",", ""))
+    except ValueError:
         return None
 
     return {
-        "amounts": amounts,
-        "phone_last4": phone_match.group(1) if phone_match else "",
-        "txn_id": txn_match.group(1),
+        "amount": amount,
+        "phone_last4": phone_match.group(1) if phone_match else None,
+        "txn_id": txn_match.group(1).upper(),
     }
+
+
+def _verify_telebirr_receipt(txn_id, expected_amount, expected_phone):
+    """Verify the public Telebirr receipt for the current Deposit only.
+
+    The receipt is read from the official public receipt URL and the labelled
+    receipt fields are checked: receipt/reference number, settled amount,
+    successful transaction status, and credited-party Telebirr number.
+    """
+    import html as _html
+    from urllib.request import Request, urlopen
+
+    txn_id = str(txn_id or "").strip().upper()
+    if not re.fullmatch(r"[A-Z0-9]{8,20}", txn_id, re.IGNORECASE):
+        return False
+
+    url = f"https://transactioninfo.ethiotelecom.et/receipt/{txn_id}"
+    try:
+        request = Request(
+            url,
+            headers={"User-Agent": "Mozilla/5.0"},
+            method="GET",
+        )
+        with urlopen(request, timeout=15) as response:
+            if getattr(response, "status", 200) != 200:
+                return False
+            raw_html = response.read().decode("utf-8", "ignore")
+    except Exception as e:
+        log.warning("Telebirr receipt verification failed for %s: %s", txn_id, e)
+        return False
+
+    # Telebirr receipts are table-based. Read the value following each known
+    # label instead of depending on one exact HTML layout/spacing.
+    td_values = re.findall(r"<td\b[^>]*>(.*?)</td>", raw_html, flags=re.IGNORECASE | re.DOTALL)
+    values = []
+    for item in td_values:
+        item = re.sub(r"<br\s*/?>", " ", item, flags=re.IGNORECASE)
+        item = re.sub(r"<[^>]+>", " ", item)
+        item = _html.unescape(item)
+        item = " ".join(item.split()).strip()
+        values.append(item)
+
+    compact_values = [re.sub(r"\s+", "", v).lower() for v in values]
+
+    def value_after(labels):
+        labels = {re.sub(r"\s+", "", x).lower() for x in labels}
+        for i, value in enumerate(compact_values):
+            if value in labels and i + 1 < len(values):
+                return values[i + 1].strip()
+        return None
+
+    receipt_no = value_after([
+        "የክፍያቁጥር/receiptno.",
+        "የክፍያቁጥር/receiptno",
+    ])
+    settled_amount = value_after([
+        "የተከፈለውመጠን/settledamount",
+        "settledamount",
+    ])
+    status = value_after([
+        "የክፍያውሁኔታ/transactionstatus",
+        "transactionstatus",
+    ])
+    credited_account = value_after([
+        "የገንዘብተቀባይቴሌብርቁ./creditedpartyaccountno",
+        "creditedpartyaccountno",
+    ])
+
+    # Some receipt layouts place a value one extra table cell away for the
+    # amount/status/account fields. If the direct value is absent, use the
+    # normalized receipt text as a conservative fallback.
+    receipt_text = " ".join(values)
+    compact = re.sub(r"\s+", "", receipt_text).lower()
+
+    if receipt_no:
+        if re.sub(r"\s+", "", receipt_no).upper() != txn_id:
+            return False
+    elif txn_id.lower() not in compact:
+        return False
+
+    amount_text = settled_amount
+    if not amount_text:
+        amount_match = re.search(
+            r"(?:የተከፈለውመጠን/settledamount|settledamount)\s*[:\-]?\s*([\d,]+(?:\.\d+)?)",
+            compact,
+            re.IGNORECASE,
+        )
+        if not amount_match:
+            return False
+        amount_text = amount_match.group(1)
+
+    amount_match = re.search(r"[\d,]+(?:\.\d+)?", amount_text)
+    if not amount_match:
+        return False
+    try:
+        receipt_amount = float(amount_match.group(0).replace(",", ""))
+    except ValueError:
+        return False
+    if abs(receipt_amount - float(expected_amount)) > 0.000001:
+        return False
+
+    status_text = re.sub(r"\s+", "", status or "").lower()
+    if not status_text:
+        status_text = compact
+    if not re.search(
+        r"(?:success|successful|completed|successfultransaction|ተሳክቷል|ተጠናቋል)",
+        status_text,
+        re.IGNORECASE,
+    ):
+        return False
+
+    expected_last4 = re.sub(r"\D", "", str(expected_phone or ""))[-4:]
+    if not expected_last4:
+        return False
+
+    account_text = credited_account
+    if not account_text:
+        account_match = re.search(
+            r"(?:የገንዘብተቀባይቴሌብርቁ\./creditedpartyaccountno)"
+            r"\s*[:\-]?\s*([0-9*]+)",
+            compact,
+            re.IGNORECASE,
+        )
+        if account_match:
+            account_text = account_match.group(1)
+
+    if not account_text:
+        return False
+
+    account_digits = re.sub(r"\D", "", account_text)
+    if account_digits[-4:] != expected_last4:
+        return False
+
+    return True
 
 
 INSTRUCTIONS_TEXT = """🃏 መጫወቻ ካርድ
@@ -355,18 +471,6 @@ async def play_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _run_menu_action("play", update.message, update.effective_user, context)
 
 
-async def instruction_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await _run_menu_action("instruction", update.message, update.effective_user, context)
-
-
-async def contactsupport_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await _run_menu_action("support", update.message, update.effective_user, context)
-
-
-async def invite_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await _run_menu_action("invite", update.message, update.effective_user, context)
-
-
 async def withdraw_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _run_menu_action("withdraw", update.message, update.effective_user, context)
 
@@ -460,82 +564,96 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif flow == "deposit_sms":
         parsed = parse_telebirr_sms(text)
+        requested_amount = float(data.get("amount", -1))
 
         if parsed is None:
-            log.info(f"Deposit SMS unparseable for user {user_id}: could not extract amount+txn_id from text")
             await update.message.reply_text(
-                "🚫 ኤስኤምኤሱ ሊነበብ አልቻለም። እባክዎ ስልክዎ ላይ የገባውን ትክክለኛ ሚሴጅ (SMS) ሙሉ በሙሉ ኮፒ አድርገው ይላኩ፡፡\n\n"
+                "🚫 የTelebirr SMS መረጃው አልተረጋገጠም። እባክዎ ከTelebirr የመጣውን ትክክለኛ SMS ብቻ ይላኩ።\n\n"
                 f"❓ለድጋፍ @{SUPPORT_USERNAME} ላይ ይፃፉልን"
             )
             return
 
-        # Validate the amount by checking ALL "X ብር" figures found in the
-        # message against what the user said they were sending -- not just
-        # the first one. Real Telebirr messages sometimes mention more than
-        # one amount (e.g. a service fee alongside the actual transfer), and
-        # blindly trusting the first match was rejecting genuinely valid
-        # deposits when it happened to grab the wrong figure. If ANY
-        # candidate matches what the user stated, we know we found the real
-        # transferred amount.
-        stated_amount = data.get("amount")
-        matched_amount = None
-        if stated_amount is not None:
-            for candidate in parsed["amounts"]:
-                if abs(candidate - float(stated_amount)) <= 0.01:
-                    matched_amount = candidate
-                    break
-
-        if matched_amount is None:
-            log.info(
-                f"Deposit SMS amount mismatch for user {user_id}: "
-                f"stated={stated_amount}, found candidates={parsed['amounts']}, txn={parsed['txn_id']}"
-            )
+        if abs(parsed["amount"] - requested_amount) > 0.000001:
             await update.message.reply_text(
-                "🚫 SMS ላይ ያለው የገንዘብ መጠን ካስገቡት መጠን ጋር አይመሳሰልም። እባክዎ ትክክለኛውን ሚሴጅ (SMS) ያረጋግጡ እና እንደገና ይላኩ፡፡\n\n"
+                f"🚫 የTelebirr SMS መጠን ({parsed['amount']:g} ETB) ከጠየቁት {requested_amount:g} ETB ጋር አይመሳሰልም።"
+            )
+            return
+
+        txn_id = parsed["txn_id"]
+        if used_deposit_ids_ref.child(txn_id).get():
+            await update.message.reply_text(
+                "❌ ይህ Transaction ID ከዚህ በፊት ጥቅም ላይ ውሏል። ሁለት ጊዜ ሊከፈል አይችልም።"
+            )
+            return
+
+        # Verify the transaction against the public Telebirr receipt before
+        # reserving the ID or changing the user's wallet.
+        receipt_ok = await asyncio.to_thread(
+            _verify_telebirr_receipt,
+            txn_id,
+            requested_amount,
+            data.get("payToPhone", ""),
+        )
+        if not receipt_ok:
+            await update.message.reply_text(
+                "🚫 የTelebirr transaction receipt ማረጋገጥ አልተቻለም።\n"
+                "Transaction ID, amount እና የተላከበት የTelebirr ቁጥር እንደሚመሳሰሉ ያረጋግጡ።\n\n"
                 f"❓ለድጋፍ @{SUPPORT_USERNAME} ላይ ይፃፉልን"
             )
             return
 
-        # Atomically check-and-reserve this transaction ID in a single Firebase
-        # transaction, so two near-simultaneous submissions of the same SMS
-        # (whether from this player double-tapping or two different players)
-        # can never both slip through -- only whichever one wins the race gets
-        # reserved, and the loser is told it's already used.
-        already_used_holder = {"already_used": False}
+        # Reserve the transaction ID atomically so the same receipt cannot be
+        # credited twice even if two submissions arrive almost simultaneously.
+        def claim_transaction(current):
+            return True if current is None else current
 
-        def reserve(current):
-            if current:
-                already_used_holder["already_used"] = True
-                return current  # no-op -- leave the existing reservation as-is
-            return True
-
-        used_deposit_ids_ref.child(parsed["txn_id"]).transaction(reserve)
-
-        if already_used_holder["already_used"]:
-            log.info(f"Deposit SMS duplicate for user {user_id}: txn_id={parsed['txn_id']} already reserved")
+        claimed = used_deposit_ids_ref.child(txn_id).transaction(claim_transaction)
+        if claimed is not True:
             await update.message.reply_text(
-                "🚫 ይህ የደረሰኝ ቁጥር (transaction ID) ቀድሞ ጥቅም ላይ ውሏል። እያንዳንዱ ደረሰኝ አንድ ጊዜ ብቻ ጥቅም ላይ ሊውል ይችላል፡፡\n\n"
-                f"❓ለድጋፍ @{SUPPORT_USERNAME} ላይ ይፃፉልን"
+                "❌ ይህ Transaction ID ከዚህ በፊት ጥቅም ላይ ውሏል። ሁለት ጊዜ ሊከፈል አይችልም።"
             )
             return
 
-        sms_amount = matched_amount
         data["smsText"] = text
-        key = deposits_ref.push({
+        amount = int(requested_amount) if requested_amount.is_integer() else requested_amount
+
+        # Preserve the existing wallet behavior used by the admin approval
+        # path: deposits increase Play Wallet and deposited total.
+        wallet_ref = _wallet_ref(user_id)
+
+        def credit(current):
+            current = current or {"main": 0, "play": 0, "deposited": 0}
+            current["play"] = current.get("play", 0) + requested_amount
+            current["deposited"] = current.get("deposited", 0) + requested_amount
+            return current
+
+        try:
+            wallet_ref.transaction(credit)
+        except Exception as e:
+            used_deposit_ids_ref.child(txn_id).delete()
+            log.warning("Wallet credit failed for deposit %s: %s", txn_id, e)
+            await update.message.reply_text(
+                "🚫 የWallet ክሬዲት አልተሳካም። ገንዘቡ እንዳይደገም ግብይቱ አልተፈቀደም። እባክዎ ድጋፍ ያግኙ።"
+            )
+            return
+
+        deposits_ref.push({
             "by": user_id,
             "name": data.get("name", "Player"),
-            "amount": sms_amount,
+            "amount": amount,
             "phone": data.get("payToPhone", ""),
             "smsText": text,
             "paidTo": data.get("payToPhone", ""),
-            "txnId": parsed["txn_id"],
-            "status": "pending",
-        }).key
+            "txnId": txn_id,
+            "receiptUrl": f"https://transactioninfo.ethiotelecom.et/receipt/{txn_id}",
+            "status": "approved",
+        })
+
         context.user_data["flow"] = None
         context.user_data["flow_data"] = {}
         await update.message.reply_text(
-            f"⏳ Deposit request of {sms_amount} coins submitted (ID {key}). "
-            f"Waiting for admin approval."
+            f"✅ Your deposit of {amount} ETB is Approved.\n"
+            f"🧾 Ref: {txn_id}"
         )
 
     # ---- Withdraw flow: amount -> phone ----
@@ -583,6 +701,56 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
+# ---- Admin-only test balance (temporary QA tool) ----
+# Usage from the ADMIN account only:
+#   /testbalance <telegram_user_id> [amount]
+# It credits the user's Play Wallet and marks the amount as deposited
+# so the real-money stake/payout paths can be tested without a real deposit.
+# Remove this handler after multiplayer testing is complete.
+async def testbalance_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_CHAT_ID:
+        await update.message.reply_text("❌ Not authorized.")
+        return
+
+    args = context.args or []
+    if not args or not args[0].isdigit():
+        await update.message.reply_text(
+            "🧪 Test Balance\n\n"
+            "Usage: /testbalance USER_ID [AMOUNT]\n"
+            "Example: /testbalance 123456789 1000"
+        )
+        return
+
+    target_user_id = args[0]
+    amount = 1000
+    if len(args) >= 2:
+        try:
+            amount = int(args[1])
+        except ValueError:
+            await update.message.reply_text("❌ Amount must be a whole number.")
+            return
+
+    if amount <= 0:
+        await update.message.reply_text("❌ Amount must be greater than 0.")
+        return
+
+    wallet_ref = _wallet_ref(target_user_id)
+
+    def credit_test(current):
+        current = current or {"main": 0, "play": 0, "deposited": 0}
+        current["play"] = float(current.get("play", 0) or 0) + amount
+        current["deposited"] = float(current.get("deposited", 0) or 0) + amount
+        return current
+
+    wallet = wallet_ref.transaction(credit_test)
+    await update.message.reply_text(
+        f"🧪 Test balance added\n"
+        f"User ID: {target_user_id}\n"
+        f"Added to Play Wallet: {amount} ብር\n"
+        f"Play Wallet now: {wallet.get('play', 0)} ብር"
+    )
+
+
 # ---- Approve/Reject button handler (admin only) ----
 async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -595,32 +763,16 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     action, kind, key = query.data.split(":", 2)  # e.g. "approve:deposit:ABC123"
 
     if kind == "deposit":
-        # Atomically claim this deposit for processing: only one concurrent
-        # Approve/Reject click (or duplicate Telegram callback) can ever win
-        # this transaction. Whoever loses the race gets told it's already
-        # being handled and does nothing further -- this is what actually
-        # prevents a double-tap from crediting the wallet twice.
-        claim_holder = {"record": None, "already_claimed": False}
-
-        def claim(current):
-            if not current or current.get("status") != "pending":
-                claim_holder["already_claimed"] = True
-                return current  # no-op -- someone already claimed/handled it
-            current = dict(current)
-            current["status"] = "processing"
-            return current
-
-        result = deposits_ref.child(key).transaction(claim)
-        record = result.snapshot.val() if hasattr(result, "snapshot") else deposits_ref.child(key).get()
-
+        record = deposits_ref.child(key).get()
         if not record:
             await query.edit_message_text("⚠️ Record not found (maybe already handled).")
             return
-        if claim_holder["already_claimed"]:
-            await query.edit_message_text(f"ℹ️ Already {record.get('status')} (or already being processed).")
+        if record.get("status") != "pending":
+            await query.edit_message_text(f"ℹ️ Already {record.get('status')}.")
             return
 
         if action == "approve":
+            deposits_ref.child(key).update({"status": "approved"})
             user_id = str(record["by"])
             amount = record["amount"]
             wallet_ref = db.reference(f"users/{user_id}/wallet")
@@ -631,27 +783,7 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 current["deposited"] = current.get("deposited", 0) + amount
                 return current
 
-            try:
-                # Credit the wallet FIRST. Only mark the deposit "approved" once
-                # this has actually succeeded -- if we mark it approved first and
-                # the credit call then fails/gets interrupted (e.g. a cold-start
-                # timeout on the free Render tier), the deposit is stuck showing
-                # "approved" forever with no way to safely retry, and the money
-                # looks like it vanished. Doing it in this order means a failure
-                # here leaves it safely retryable.
-                wallet_ref.transaction(credit)
-            except Exception as e:
-                log.exception(f"Wallet credit FAILED for deposit {key} (user {user_id}, amount {amount})")
-                # Release our claim back to "pending" so Approve can be safely
-                # pressed again -- we never leave it stuck on "processing".
-                deposits_ref.child(key).update({"status": "pending"})
-                await query.edit_message_text(
-                    f"⚠️ Wallet credit FAILED for {record.get('name')} ({amount} coins).\n"
-                    f"Error: {e}\n\nDeposit is still PENDING -- press Approve again to retry."
-                )
-                return
-
-            deposits_ref.child(key).update({"status": "approved"})
+            wallet_ref.transaction(credit)
             await query.edit_message_text(f"✅ Approved deposit of {amount} coins for {record.get('name')}.")
             try:
                 await context.bot.send_message(
@@ -798,9 +930,7 @@ def main():
     app.add_handler(CommandHandler("deposit", deposit_command))
     app.add_handler(CommandHandler("withdraw", withdraw_command))
     app.add_handler(CommandHandler("play", play_command))
-    app.add_handler(CommandHandler("instruction", instruction_command))
-    app.add_handler(CommandHandler("contactsupport", contactsupport_command))
-    app.add_handler(CommandHandler("invite", invite_command))
+    app.add_handler(CommandHandler("testbalance", testbalance_command))
     app.add_handler(CallbackQueryHandler(menu_handler, pattern=r"^menu:"))
     app.add_handler(CallbackQueryHandler(deposit_payment_handler, pattern=r"^deppay:"))
     app.add_handler(CallbackQueryHandler(handle_button, pattern=r"^(approve|reject):"))
