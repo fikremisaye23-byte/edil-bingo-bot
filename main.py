@@ -36,7 +36,6 @@ from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    CopyTextButton,
     WebAppInfo,
     KeyboardButton,
     ReplyKeyboardMarkup,
@@ -120,7 +119,7 @@ def parse_telebirr_sms(text):
 
     amount_match = re.search(r"([\d,]+(?:\.\d+)?)\s*ብር", norm)
     phone_match = re.search(r"\(?251\d\*+(\d{4})\)?", norm)
-    txn_match = re.search(r"(?:የሂሳብ\s*እንቅስቃሴ\s*ቁጥር(?:ዎ)?|ቁጥር(?:ዎ)?|Ref(?:erence)?|Txn(?:ID)?)\s*[:\-]?\s*([A-Z0-9]{8,20})", norm, re.IGNORECASE)
+    txn_match = re.search(r"(?:ቁጥርዎ?|የሂሳብ እንቅስቃሴ ቁጥር|Ref(?:erence)?|Txn(?:ID)?)\s*[:\-]?\s*([A-Z0-9]{8,20})", norm, re.IGNORECASE)
 
     if not (amount_match and txn_match):
         return None
@@ -137,7 +136,7 @@ def parse_telebirr_sms(text):
     }
 
 
-def _verify_telebirr_receipt(txn_id, expected_amount, allowed_phones):
+def _verify_telebirr_receipt(txn_id, expected_amount, expected_phone):
     """Verify the public Telebirr receipt for the current Deposit only.
 
     The receipt is read from the official public receipt URL and the labelled
@@ -246,12 +245,8 @@ def _verify_telebirr_receipt(txn_id, expected_amount, allowed_phones):
     ):
         return False
 
-    allowed_last4 = {
-        re.sub(r"\D", "", str(phone))[-4:]
-        for phone in allowed_phones
-        if re.sub(r"\D", "", str(phone))
-    }
-    if not allowed_last4:
+    expected_last4 = re.sub(r"\D", "", str(expected_phone or ""))[-4:]
+    if not expected_last4:
         return False
 
     account_text = credited_account
@@ -269,7 +264,7 @@ def _verify_telebirr_receipt(txn_id, expected_amount, allowed_phones):
         return False
 
     account_digits = re.sub(r"\D", "", account_text)
-    if account_digits[-4:] not in allowed_last4:
+    if account_digits[-4:] != expected_last4:
         return False
 
     return True
@@ -500,27 +495,12 @@ async def deposit_payment_handler(update: Update, context: ContextTypes.DEFAULT_
     data["payToPhone"] = number_obj["phone"]
     data["payToName"] = number_obj["name"]
     context.user_data["flow"] = "deposit_sms"
-
-    # Telegram's native CopyTextButton makes the receiving phone number itself
-    # the copy button. The user can tap the displayed number and paste it into
-    # Telebirr without a separate copy handler or extra message.
-    phone_button = InlineKeyboardButton(
-        number_obj["phone"],
-        copy_text=CopyTextButton(number_obj["phone"]),
-    )
-    keyboard = InlineKeyboardMarkup([
-        [phone_button],
-        [InlineKeyboardButton("❌ Cancel", callback_data="deppay:cancel")],
-    ])
-
     await query.message.reply_text(
-        f"የሚያጋጥማቹ የክፍያ ችግር:@{SUPPORT_USERNAME} ላይ ፃፉልን።\n\n"
-        f"1. ከታች ባለው የቴሌብር አካውንት {amount} ብር ያስገቡ\n"
-        f"Phone: {number_obj['phone']}\n\n"
-        f"📋 ስልክ ቁጥሩን ለመቅዳት ቁጥሩን ይጫኑ።\n\n"
+        f"የሚያጋጥማቹ የክፍያ ችግር:\n@{SUPPORT_USERNAME} ላይ ፃፉልን።\n\n"
+        f"1. ከታች ባለው የቴሌብር አካውንት {amount} ብር ያስገቡ\n\n"
+        f"Phone:\n{number_obj['phone']}\n\n"
         f"2. የከፈሉበትን አጭር የጹሁፍ መልዕክት(message) copy በማድረግ እዚ ላይ Paste "
-        f"አድርገው ያስገቡና ይላኩት👇👇👇",
-        reply_markup=keyboard,
+        f"አድርገው ያስገቡና ይላኩት\n👇👇👇"
     )
 
 
@@ -608,18 +588,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Verify the transaction against the public Telebirr receipt before
         # reserving the ID or changing the user's wallet.
-        allowed_phones = [item["phone"] for item in TELEBIRR_NUMBERS]
-        if parsed.get("phone_last4") not in {phone[-4:] for phone in allowed_phones}:
-            await update.message.reply_text(
-                "🚫 የTelebirr SMS የተቀባይ ቁጥር ከቦቱ የተቀመጡ መቀበያ ቁጥሮች ጋር አይመሳሰልም።"
-            )
-            return
-
         receipt_ok = await asyncio.to_thread(
             _verify_telebirr_receipt,
             txn_id,
             requested_amount,
-            allowed_phones,
+            data.get("payToPhone", ""),
         )
         if not receipt_ok:
             await update.message.reply_text(
