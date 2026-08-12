@@ -34,6 +34,7 @@ import urllib.error
 from datetime import datetime
 
 import firebase_admin
+import telegram
 from firebase_admin import credentials, db
 from flask import Flask
 from telegram import (
@@ -70,6 +71,20 @@ log = logging.getLogger(__name__)
 # httpx logs full request URLs at INFO level, which would leak the bot token
 # (it's part of the URL). Silence it so the console never shows the token.
 logging.getLogger("httpx").setLevel(logging.WARNING)
+
+
+async def _safe_answer(query, *args, **kwargs):
+    """
+    Wrapper around query.answer() that swallows the "query is too old"
+    error Telegram raises when a callback query wasn't answered in time
+    (e.g. the bot was momentarily slow, or Render's free tier was waking
+    up from sleep). Without this, that single exception used to bubble
+    up unhandled and crash the whole bot process.
+    """
+    try:
+        await query.answer(*args, **kwargs)
+    except telegram.error.BadRequest as e:
+        log.warning(f"Could not answer callback query (likely expired): {e}")
 
 # ---- Firebase setup ----
 service_account_info = json.loads(FIREBASE_SERVICE_ACCOUNT_JSON)
@@ -423,7 +438,7 @@ async def _run_menu_action(action, reply_target, user, context):
 # ---- Main menu button handler ----
 async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    await _safe_answer(query)
     action = query.data.split(":", 1)[1]
     await _run_menu_action(action, query.message, query.from_user, context)
 
@@ -466,7 +481,7 @@ async def withdraw_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---- Deposit payment-method button handler (Telebirr / Cancel) ----
 async def deposit_payment_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    await _safe_answer(query)
     choice = query.data.split(":", 1)[1]
 
     if choice == "cancel":
@@ -799,10 +814,10 @@ def _credit_deposit_wallet(user_id, amount):
 # ---- Approve/Reject button handler (admin only) ----
 async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    await _safe_answer(query)
 
     if query.from_user.id != ADMIN_CHAT_ID:
-        await query.answer("❌ You are not authorized.", show_alert=True)
+        await _safe_answer(query, "❌ You are not authorized.", show_alert=True)
         return
 
     action, kind, key = query.data.split(":", 2)  # e.g. "approve:withdrawal:ABC123"
@@ -895,9 +910,18 @@ async def on_startup(application):
     log.info("Event loop captured; admin notifications are now live.")
 
 
+# ---- Global error handler: logs any unhandled exception instead of
+# letting it crash the whole bot process (which is what was happening
+# before, e.g. on "query is too old" errors from slow/expired callback
+# queries). ----
+async def error_handler(update, context: ContextTypes.DEFAULT_TYPE):
+    log.error("Unhandled exception while processing an update", exc_info=context.error)
+
+
 def main():
     global app
     app = Application.builder().token(BOT_TOKEN).post_init(on_startup).build()
+    app.add_error_handler(error_handler)
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("register", register_command))
