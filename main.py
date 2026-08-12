@@ -31,7 +31,7 @@ import threading
 import time
 import urllib.request
 import urllib.error
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from html.parser import HTMLParser
 
 import firebase_admin
@@ -742,7 +742,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # because receipt variants do not all expose that field.
             status_text = str(receipt.get("status", "")).lower().strip()
             status_ok = (not status_text) or any(
-                word in status_text for word in ("success", "successful", "completed", "ተሳክቷል", "ተሳካ")
+                word in status_text for word in ("success", "successful", "completed", "complete", "settled", "ተሳክቷል", "ተሳካ")
             )
 
             freshness_ok = True
@@ -759,7 +759,16 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     except ValueError:
                         continue
                 if parsed_dt:
-                    age_seconds = (datetime.now() - parsed_dt).total_seconds()
+                    # Telebirr timestamps are Ethiopia local time (UTC+3),
+                    # while Render commonly runs in UTC. Comparing naive
+                    # datetimes here makes a brand-new deposit look about
+                    # three hours old and incorrectly fails auto-verification.
+                    ethiopia_tz = timezone(timedelta(hours=3))
+                    receipt_aware = parsed_dt.replace(tzinfo=ethiopia_tz)
+                    age_seconds = (
+                        datetime.now(timezone.utc)
+                        - receipt_aware.astimezone(timezone.utc)
+                    ).total_seconds()
                     freshness_ok = -300 <= age_seconds <= 3600
 
             ceiling_ok = receipt["amount"] <= AUTO_APPROVE_MAX_AMOUNT
@@ -780,6 +789,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["flow_data"] = {}
 
         if verified:
+            # Reserve only after the official receipt has passed all checks.
+            # This keeps a genuine deposit retryable when the receipt service
+            # is temporarily slow or unavailable. The Firebase transaction
+            # still prevents two simultaneous submissions from both crediting.
             reserved_holder = {"duplicate": False}
 
             def reserve_after_verify(current):
