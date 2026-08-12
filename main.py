@@ -28,6 +28,7 @@ import os
 import random
 import re
 import threading
+import time
 import urllib.request
 import urllib.error
 from datetime import datetime
@@ -80,6 +81,32 @@ withdrawals_ref = db.reference("transactions/withdrawals")
 # Keeps track of Telebirr transaction IDs that have already been used for a
 # deposit, so the same confirmation SMS can't be submitted twice.
 used_deposit_ids_ref = db.reference("transactions/usedDepositIds")
+
+# Fraud-hardening: throttle how often any one user can attempt a deposit
+# submission, so someone can't brute-force-spam the verification endpoint
+# (e.g. rapidly trying many receipt numbers hoping one happens to verify).
+# In-memory is fine here -- worst case a restart resets everyone's cooldown,
+# which is not a security issue, just occasionally more lenient.
+_deposit_attempt_times = {}
+_deposit_attempt_lock = threading.Lock()
+DEPOSIT_RATE_LIMIT_MAX = 5       # attempts
+DEPOSIT_RATE_LIMIT_WINDOW = 600  # seconds (10 minutes)
+# Fraud-hardening: even a fully verified deposit above this amount is routed
+# to support instead of being auto-credited -- an extra layer of caution for
+# unusually large sums, in case the verification logic itself is ever wrong
+# or the page format changes in a way we haven't caught. Adjust as needed.
+AUTO_APPROVE_MAX_AMOUNT = 2000
+
+
+def _deposit_rate_limited(user_id):
+    """Returns True if this user should be blocked for now (too many recent attempts)."""
+    now = time.time()
+    with _deposit_attempt_lock:
+        recent = [t for t in _deposit_attempt_times.get(user_id, []) if now - t < DEPOSIT_RATE_LIMIT_WINDOW]
+        recent.append(now)
+        _deposit_attempt_times[user_id] = recent
+        return len(recent) > DEPOSIT_RATE_LIMIT_MAX
+
 
 # Same three receiving numbers, and the same round-robin rotation counter
 # (deposits/rotationIndex), as the Mini App -- so whichever channel a user
@@ -457,15 +484,10 @@ async def deposit_payment_handler(update: Update, context: ContextTypes.DEFAULT_
     data["payToName"] = number_obj["name"]
     context.user_data["flow"] = "deposit_sms"
     await query.message.reply_text(
-        f"💰 *{amount} ብር ማስገባት*\n\n"
-        f"*① የቴሌብር ገንዘብ ላኪ*\n"
-        f"ከታች ወዳለው ቁጥር *{amount} ብር* ብቻ ይላኩ (ቁጥሩን ነክተው ኮፒ ማድረግ ይችላሉ)፦\n\n"
-        f"📱 `{number_obj['phone']}`\n\n"
-        f"*② ደረሰኙን (SMS) ይላኩልን*\n"
-        f"ገንዘቡን ከላኩ በኋላ ስልክዎ ላይ የሚደርስዎትን የቴሌብር ማረጋገጫ መልእክት *ሙሉ በሙሉ* ኮፒ አድርገው እዚህ ላይ ይለጥፉ።\n\n"
-        f"👇 SMS ኮፒ አድርገው እዚህ ይለጥፉ 👇\n\n"
-        f"⚠️ ትክክለኛ ያልሆነ ወይም ያልተሟላ መልእክት ካስገቡ ጥያቄው ተቀባይነት አያገኝም።\n"
-        f"❓ ችግር ካጋጠመዎት @{SUPPORT_USERNAME} ላይ ይፃፉልን",
+        f"1. ከታች ባለው የቴሌብር አካውንት {amount} ብር ያስገቡ\n\n"
+        f"Phone:\n`{number_obj['phone']}`\n\n"
+        f"2. የከፈሉበትን አጭር የጹሁፍ መልዕክት(message) copy በማድረግ እዚ ላይ Paste "
+        f"አድርገው ያስገቡና ይላኩት\n👇👇👇",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="deppay:cancel")]]),
     )
@@ -530,6 +552,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif flow == "deposit_sms":
+        if _deposit_rate_limited(user_id):
+            log.warning(f"Deposit rate limit hit for user {user_id}")
+            await update.message.reply_text(
+                "🚫 በአጭር ጊዜ ውስጥ በጣም ብዙ ጥያቄ ልከዋል። እባክዎ ትንሽ ቆይተው ደግመው ይሞክሩ ወይም "
+                f"@{SUPPORT_USERNAME} ላይ ይፃፉልን።"
+            )
+            return
+
         parsed = parse_telebirr_sms(text)
 
         # Extract a receipt/transaction reference number -- either from a
@@ -541,6 +571,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         receipt_no = receipt_url_match.group(1) if receipt_url_match else (
             parsed["txn_id"] if parsed else None
         )
+
+        # Defense in depth: whatever the source, only accept a strictly
+        # alphanumeric reference of a sane length before we ever use it to
+        # build a URL or as a Firebase key.
+        if receipt_no and not re.fullmatch(r"[A-Za-z0-9]{6,20}", receipt_no):
+            receipt_no = None
 
         if not receipt_no:
             log.info(f"Deposit submission unparseable for user {user_id}: no receipt/txn ID found")
@@ -615,12 +651,18 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     age_seconds = (datetime.now() - parsed_dt).total_seconds()
                     freshness_ok = -300 <= age_seconds <= 3600  # allow a little clock skew, cap at 1 hour old
 
-            verified = amount_ok and phone_ok and freshness_ok
+            # Fraud-hardening: even if everything else checks out, cap how
+            # large an auto-approved deposit can be -- large sums get routed
+            # to support instead, as an extra layer of caution.
+            ceiling_ok = receipt["amount"] <= AUTO_APPROVE_MAX_AMOUNT
+
+            verified = amount_ok and phone_ok and freshness_ok and ceiling_ok
             verified_amount = receipt["amount"]
             if not verified:
                 log.info(
                     f"Auto-verify failed for {receipt_no}: amount_ok={amount_ok} "
-                    f"phone_ok={phone_ok} freshness_ok={freshness_ok} receipt={receipt} stated={stated_amount}"
+                    f"phone_ok={phone_ok} freshness_ok={freshness_ok} ceiling_ok={ceiling_ok} "
+                    f"receipt={receipt} stated={stated_amount}"
                 )
         else:
             log.info(f"Auto-verify: could not fetch/parse receipt page for {receipt_no}")
@@ -643,7 +685,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "autoVerified": True,
                 }).key
                 await update.message.reply_text(
-                    f"✅ ዲፖዚት ተረጋግጦ ፀድቋል! {verified_amount} ኮይን ወደ ዋሌትዎ ገብቷል።\n"
+                    f"✅ Your deposit of {verified_amount} ETB is Approved.\n"
                     f"Ref: {receipt_no}"
                 )
                 try:
@@ -655,16 +697,15 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     log.warning(f"Could not send admin FYI for auto-approved deposit: {e}")
                 return
             # Wallet credit failed even though verification succeeded --
-            # release the reservation isn't needed (receipt_no stays reserved,
-            # correctly preventing reuse) and fall through to manual review
-            # below so the admin can sort it out instead of the money being lost.
+            # the receipt_no stays reserved (correctly preventing reuse) and
+            # we fall through to the failed-verification message below so the
+            # user is directed to support instead of the money being lost.
             log.warning(f"Auto-verified but wallet credit failed for {receipt_no}: {err}")
 
-        # --- Could not auto-verify (or credit failed) -- fall back to the
-        # same manual admin-review path as before. Use the SMS-parsed amount
-        # if we found one matching what the user stated, otherwise their
-        # stated amount, so the admin sees a sensible figure to check against
-        # the raw SMS text.
+        # --- Could not auto-verify (or credit failed). There is no manual
+        # admin-approval step anymore, so we must NOT tell the user "waiting
+        # for admin" -- that would never resolve. Store the attempt for
+        # support's reference and direct the user there directly.
         fallback_amount = stated_amount
         if parsed:
             for candidate in parsed["amounts"]:
@@ -680,11 +721,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "smsText": text,
             "paidTo": data.get("payToPhone", ""),
             "txnId": receipt_no,
-            "status": "pending",
+            "status": "failed_verification",
         }).key
         await update.message.reply_text(
-            f"⏳ Deposit request of {fallback_amount} coins submitted (ID {key}). "
-            f"Waiting for admin approval."
+            f"⚠️ ራስ-ሰር ማረጋገጫ አልተሳካም። እባክዎ ደረሰኝ ቁጥርዎን ({receipt_no}) ይዘው "
+            f"@{SUPPORT_USERNAME} ላይ ይፃፉልን፣ በእጅ እናረጋግጥልዎታለን።"
         )
 
     # ---- Withdraw flow: amount -> phone ----
@@ -716,7 +757,21 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return current
 
         result = _wallet_ref(user_id_str).transaction(deduct)
-        # python-firebase-admin's transaction() returns the committed value
+
+        # Only create a withdrawal request if the balance deduction actually
+        # succeeded. If the balance changed between the initial check and the
+        # transaction, deduct() returns the unchanged wallet and no request
+        # should be created.
+        committed_main = (result or {}).get("main", 0)
+        if committed_main > wallet.get("main", 0) - amount:
+            context.user_data["flow"] = None
+            context.user_data["flow_data"] = {}
+            await update.message.reply_text(
+                "⚠️ የእርስዎ ባላንስ በዚህ መካከል ተቀይሯል። "
+                "እባክዎ የቀረውን ባላንስ እንደገና ያረጋግጡና ይሞክሩ።"
+            )
+            return
+
         key = withdrawals_ref.push({
             "by": user_id_str,
             "name": data.get("name", "Player"),
@@ -764,77 +819,9 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("❌ You are not authorized.", show_alert=True)
         return
 
-    action, kind, key = query.data.split(":", 2)  # e.g. "approve:deposit:ABC123"
+    action, kind, key = query.data.split(":", 2)  # e.g. "approve:withdrawal:ABC123"
 
-    if kind == "deposit":
-        # Atomically claim this deposit for processing: only one concurrent
-        # Approve/Reject click (or duplicate Telegram callback) can ever win
-        # this transaction. Whoever loses the race gets told it's already
-        # being handled and does nothing further -- this is what actually
-        # prevents a double-tap from crediting the wallet twice.
-        claim_holder = {"record": None, "already_claimed": False}
-
-        def claim(current):
-            if not current or current.get("status") != "pending":
-                claim_holder["already_claimed"] = True
-                return current  # no-op -- someone already claimed/handled it
-            current = dict(current)
-            current["status"] = "processing"
-            return current
-
-        result = deposits_ref.child(key).transaction(claim)
-        record = result.snapshot.val() if hasattr(result, "snapshot") else deposits_ref.child(key).get()
-
-        if not record:
-            await query.edit_message_text("⚠️ Record not found (maybe already handled).")
-            return
-        if claim_holder["already_claimed"]:
-            await query.edit_message_text(f"ℹ️ Already {record.get('status')} (or already being processed).")
-            return
-
-        if action == "approve":
-            user_id = str(record["by"])
-            amount = record["amount"]
-
-            # Credit the wallet FIRST. Only mark the deposit "approved" once
-            # this has actually succeeded -- if we mark it approved first and
-            # the credit call then fails/gets interrupted (e.g. a cold-start
-            # timeout on the free Render tier), the deposit is stuck showing
-            # "approved" forever with no way to safely retry, and the money
-            # looks like it vanished. Doing it in this order means a failure
-            # here leaves it safely retryable.
-            success, err = _credit_deposit_wallet(user_id, amount)
-            if not success:
-                # Release our claim back to "pending" so Approve can be safely
-                # pressed again -- we never leave it stuck on "processing".
-                deposits_ref.child(key).update({"status": "pending"})
-                await query.edit_message_text(
-                    f"⚠️ Wallet credit FAILED for {record.get('name')} ({amount} coins).\n"
-                    f"Error: {err}\n\nDeposit is still PENDING -- press Approve again to retry."
-                )
-                return
-
-            deposits_ref.child(key).update({"status": "approved"})
-            await query.edit_message_text(f"✅ Approved deposit of {amount} coins for {record.get('name')}.")
-            try:
-                await context.bot.send_message(
-                    chat_id=int(user_id),
-                    text=f"✅ Deposit Success! {amount} ኮይን ወደ ዋሌትዎ ገብቷል።",
-                )
-            except Exception as e:
-                log.warning(f"Could not notify depositor {user_id} of approval: {e}")
-        else:
-            deposits_ref.child(key).update({"status": "rejected"})
-            await query.edit_message_text(f"❌ Rejected deposit ({record.get('amount')} coins) for {record.get('name')}.")
-            try:
-                await context.bot.send_message(
-                    chat_id=int(record["by"]),
-                    text=f"❌ Deposit Reject. የ{record.get('amount')} ኮይን ተቀማጭ ገንዘብ ጥያቄዎ ውድቅ ሆኗል።",
-                )
-            except Exception as e:
-                log.warning(f"Could not notify depositor {record['by']} of rejection: {e}")
-
-    elif kind == "withdrawal":
+    if kind == "withdrawal":
         record = withdrawals_ref.child(key).get()
         if not record:
             await query.edit_message_text("⚠️ Record not found (maybe already handled).")
@@ -867,18 +854,6 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ---- Firebase realtime listeners: notify admin of new pending requests ----
-def on_deposit_change(event):
-    if event.data is None:
-        return
-    if event.path == "/":
-        return  # skip the initial full snapshot
-    key = event.path.strip("/")
-    record = event.data
-    if not isinstance(record, dict) or record.get("status") != "pending":
-        return
-    _notify_admin_deposit(key, record)
-
-
 def on_withdrawal_change(event):
     if event.data is None:
         return
@@ -889,23 +864,6 @@ def on_withdrawal_change(event):
     if not isinstance(record, dict) or record.get("status") != "pending":
         return
     _notify_admin_withdrawal(key, record)
-
-
-def _notify_admin_deposit(key, record):
-    text = (
-        f"💰 New Deposit Request\n"
-        f"Name: {record.get('name')}\n"
-        f"Amount: {record.get('amount')} coins\n"
-        f"Paid To: {record.get('paidTo', '-')}\n"
-        f"Telebirr Txn ID: {record.get('txnId', '-')}\n"
-        f"Request ID: {key}\n\n"
-        f"SMS:\n{record.get('smsText', '')[:300]}"
-    )
-    keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ Approve", callback_data=f"approve:deposit:{key}"),
-        InlineKeyboardButton("❌ Reject", callback_data=f"reject:deposit:{key}"),
-    ]])
-    _send_to_admin(text, keyboard)
 
 
 def _notify_admin_withdrawal(key, record):
@@ -971,7 +929,6 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     # Start Firebase realtime listeners (each runs on its own background thread)
-    deposits_ref.listen(on_deposit_change)
     withdrawals_ref.listen(on_withdrawal_change)
 
     # Start the keep-alive web server on a background thread
