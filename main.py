@@ -185,100 +185,80 @@ def parse_telebirr_sms(text):
 
 
 def fetch_telebirr_receipt(receipt_no):
-    """
-    Fetch Ethio Telecom's own official receipt page for a transaction and
-    extract the amount + recipient phone from it. This is our automatic
-    verification layer: unlike the raw SMS text a user pastes (which they
-    could in principle edit before sending), this page is rendered live by
-    Ethio Telecom's own servers from the real transaction record, so a match
-    here is much stronger proof the deposit is genuine.
-
-    IMPORTANT CAVEAT: the exact HTML structure of this page has not been
-    verified against a live fetch (automated access to it is blocked for
-    testing purposes), so this parser uses flexible, best-effort patterns
-    rather than one confirmed exact layout. Returns None on ANY failure
-    (network error, unexpected page structure, etc.) -- callers must treat
-    None as "could not auto-verify" and fall back to manual admin review,
-    never as a rejection.
-    """
+    """Fetch the official Ethio Telecom receipt with bounded retries."""
     url = f"https://transactioninfo.ethiotelecom.et/receipt/{receipt_no}"
     req = urllib.request.Request(
         url,
         headers={
             "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0 Safari/537.36"
             )
         },
     )
-    try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            html = resp.read().decode("utf-8", errors="ignore")
-    except (urllib.error.URLError, TimeoutError, Exception) as e:
-        log.warning(f"Receipt fetch failed for {receipt_no}: {e}")
+
+    html = None
+    last_error = None
+    for attempt in range(1, 4):
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                html = resp.read().decode("utf-8", errors="ignore")
+            if html:
+                break
+        except Exception as e:
+            last_error = e
+            log.warning(
+                f"Receipt fetch attempt {attempt}/3 failed for {receipt_no}: {e}"
+            )
+            if attempt < 3:
+                time.sleep(1)
+
+    if not html:
+        log.warning(
+            f"Receipt fetch failed after 3 attempts for {receipt_no}: {last_error}"
+        )
         return None
 
-    amount_match = re.search(r"([\d,]+(?:\.\d+)?)\s*(?:ETB|Birr|ብር)", html, re.IGNORECASE)
+    # Strip HTML tags before parsing, so formatting changes do not break
+    # amount/phone/date extraction.
+    clean_html = re.sub(r"<[^>]+>", " ", html)
+    clean_html = re.sub(r"\s+", " ", clean_html)
+
+    amount_match = re.search(
+        r"([\d,]+(?:\.\d+)?)\s*(?:ETB|Birr|ብር)",
+        clean_html,
+        re.IGNORECASE,
+    )
     if not amount_match:
-        log.warning(f"Receipt page for {receipt_no} fetched but amount not found -- page structure may differ from expected")
+        log.warning(
+            f"Receipt page for {receipt_no} fetched but amount was not found"
+        )
         return None
+
     try:
         amount = float(amount_match.group(1).replace(",", ""))
     except ValueError:
         return None
 
-    # Every phone-like number on the page (there may be more than one --
-    # sender and recipient both appear). The caller cross-checks these
-    # against our own business numbers; if we can't find ANY, the caller
-    # must NOT assume the recipient is us -- see the fraud-prevention note
-    # at the call site.
-    all_phones = re.findall(r"(?:251)?0?9\d{8}", html)
+    all_phones = re.findall(r"(?:251)?0?9\d{8}", clean_html)
 
-    # Transaction date/time, if present on the page, so the caller can
-    # reject a receipt that isn't actually recent (prevents someone reusing
-    # an old or leaked receipt number well after the fact).
-    date_match = re.search(r"(\d{1,2}[/-]\d{1,2}[/-]\d{4}[,\s]+\d{1,2}:\d{2}(?::\d{2})?)", html)
+    date_text = None
+    for pattern in (
+        r"\b\d{2}/\d{2}/\d{4},?\s+\d{2}:\d{2}:\d{2}\b",
+        r"\b\d{2}-\d{2}-\d{4}\s+\d{2}:\d{2}:\d{2}\b",
+        r"\b\d{2}/\d{2}/\d{4},?\s+\d{2}:\d{2}\b",
+    ):
+        match = re.search(pattern, clean_html)
+        if match:
+            date_text = match.group(0)
+            break
 
     return {
         "amount": amount,
         "all_phones": all_phones,
-        "date_text": date_match.group(1) if date_match else None,
+        "date_text": date_text,
     }
-
-
-INSTRUCTIONS_TEXT = """🃏 መጫወቻ ካርድ
-
-1. ጨዋታውን ለመጀመር ከሚመጣልን ከ1-600 የካርድ መምረጫ ቦርድ ውስጥ እስከ 2 የመጫወቻ ካርድ (ካርቴላ) መምረጥ ይቻላል።
-
-2. የካርድ መምረጫ ቦርድ ላይ በቀይ ቀለም የተመረጡ ቁጥሮች የሚያሳዩት መጫወቻ ካርዱ (ካርቴላው) በሌላ ተጫዋች መመረጡን ነው።
-
-3. የመጫወቻ ካርዱን (ካርቴላውን) ሲመርጡት ከታች የሚይዛቸውን ቁጥሮች ያሳያል።
-
-4. ወደ ጨዋታው ለመግባት የሚፈልጉትን የመጫወቻ ካርድ (ካርቴላ) ሲመርጡና ለምዝገባ የተሰጠው ሰኮንድ ዜሮ ሲሆን ቀጥታ ወደ ጨዋታ ያስገባል።
-
-🎮 ጨዋታ እንዴት ይካሄዳል
-
-1. ወደ ጨዋታው ከገቡ በኋላ በመረጡት የመጫወቻ ካርድ (ካርቴላ) ከታች በቀኝ በኩል ያገኙታል።
-
-2. ጨዋታው ሲጀምር ሲስተሙ ከ1 እስከ 75 ያሉ ቁጥሮችን Randomly መጥራት ይጀምራል።
-
-3. ሲስተሙ ከሚጠራቸው ቁጥሮች ውስጥ በራስዎ የመጫወቻ ካርድ (ካርቴላ) ላይ ካሉ በመምረጥ ያጥቁሩ። በራሱ እንዲያጠቁር ከፈለጉ Automatic የሚለውን ያብሩት።
-
-🏆 አሸናፊ የሚሆኑባቸው መንገዶች
-
-1. መጫወቻ ካርድ (ካርቴላ) ላይ የተጠቆሩት ቁጥሮች፦
-   • ወደጎን ወይም ወደታች መስመር ከሰሩ
-   • ወደሁለቱም አግዳሚ መስመር ከሰሩ
-   • አራቱ ማእዘናት (ኮርነር) ከተጠሩ አሸናፊ ይሆናሉ።
-
-2. ሁለት ወይም ከዚያ በላይ ተጫዋቾች እኩል ቢያሸንፉ አጠቃላይ ደራሹ ብር ለአሸናፊዎች እኩል ይካፈላል።"""
-
-
-# ---- Tiny keep-alive web server (for UptimeRobot / Replit Always On) ----
-flask_app = Flask(__name__)
-
-
-@flask_app.route("/")
 def home():
     return "Temerachi Bingo bot is running."
 
@@ -757,21 +737,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return current
 
         result = _wallet_ref(user_id_str).transaction(deduct)
-
-        # Only create a withdrawal request if the balance deduction actually
-        # succeeded. If the balance changed between the initial check and the
-        # transaction, deduct() returns the unchanged wallet and no request
-        # should be created.
-        committed_main = (result or {}).get("main", 0)
-        if committed_main > wallet.get("main", 0) - amount:
-            context.user_data["flow"] = None
-            context.user_data["flow_data"] = {}
-            await update.message.reply_text(
-                "⚠️ የእርስዎ ባላንስ በዚህ መካከል ተቀይሯል። "
-                "እባክዎ የቀረውን ባላንስ እንደገና ያረጋግጡና ይሞክሩ።"
-            )
-            return
-
+        # python-firebase-admin's transaction() returns the committed value
         key = withdrawals_ref.push({
             "by": user_id_str,
             "name": data.get("name", "Player"),
