@@ -261,6 +261,32 @@ def fetch_telebirr_receipt(receipt_no):
     }
 
 
+def fetch_telebirr_receipt_with_retry(receipt_no, max_wait_seconds=60, poll_interval=8):
+    """
+    Keep polling Ethio Telecom's receipt page for up to max_wait_seconds,
+    since the page is sometimes slow to publish a brand-new transaction (or
+    slow to respond at all). Stops as soon as a receipt is found, or gives
+    up (returns None) once the time budget runs out -- callers must still
+    treat None as "could not auto-verify", never as "invalid", since a
+    non-existent/mistyped receipt number will also end up here.
+
+    This function does blocking network calls and time.sleep(), so callers
+    on the bot's event loop MUST run it via loop.run_in_executor(...) rather
+    than awaiting it directly, so other users aren't blocked while it polls.
+    """
+    deadline = time.time() + max_wait_seconds
+    attempt = 0
+    while True:
+        attempt += 1
+        receipt = fetch_telebirr_receipt(receipt_no)
+        if receipt is not None:
+            return receipt
+        if time.time() >= deadline:
+            log.info(f"Giving up on receipt {receipt_no} after {attempt} attempts (~{max_wait_seconds}s budget)")
+            return None
+        time.sleep(poll_interval)
+
+
 INSTRUCTIONS_TEXT = """🃏 መጫወቻ ካርድ
 
 1. ጨዋታውን ለመጀመር ከሚመጣልን ከ1-600 የካርድ መምረጫ ቦርድ ውስጥ እስከ 2 የመጫወቻ ካርድ (ካርቴላ) መምረጥ ይቻላል።
@@ -628,10 +654,22 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         stated_amount = data.get("amount")
         data["smsText"] = text
 
+        # Let the user know we're checking -- the retrying verification
+        # below can take up to a minute, and without this the chat would
+        # look unresponsive the whole time.
+        await update.message.reply_text("🔎 ደረሰኝዎን በማረጋገጥ ላይ ነው... እባክዎ ይጠብቁ (እስከ 1 ደቂቃ ሊፈጅ ይችላል)")
+
         # --- Automatic verification against Ethio Telecom's own official
         # receipt page. This is the PRIMARY path now -- if it succeeds and
         # matches, the deposit is credited immediately with no admin step.
-        receipt = fetch_telebirr_receipt(receipt_no)
+        # Retries for up to a minute (the page is sometimes slow to publish
+        # a brand-new transaction), run via run_in_executor so this blocking
+        # network polling never freezes the bot for OTHER users in the
+        # meantime.
+        loop = asyncio.get_running_loop()
+        receipt = await loop.run_in_executor(
+            None, fetch_telebirr_receipt_with_retry, receipt_no
+        )
         verified = False
         verified_amount = None
         if receipt:
