@@ -32,6 +32,7 @@ import time
 import urllib.request
 import urllib.error
 from datetime import datetime
+from html.parser import HTMLParser
 
 import firebase_admin
 import telegram
@@ -199,23 +200,42 @@ def parse_telebirr_sms(text):
     }
 
 
-def fetch_telebirr_receipt(receipt_no):
-    """
-    Fetch Ethio Telecom's own official receipt page for a transaction and
-    extract the amount + recipient phone from it. This is our automatic
-    verification layer: unlike the raw SMS text a user pastes (which they
-    could in principle edit before sending), this page is rendered live by
-    Ethio Telecom's own servers from the real transaction record, so a match
-    here is much stronger proof the deposit is genuine.
+class _TelebirrReceiptTDParser(HTMLParser):
+    """Extract bilingual Telebirr receipt fields from the official HTML table."""
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.in_td = False
+        self.current = []
+        self.cells = []
 
-    IMPORTANT CAVEAT: the exact HTML structure of this page has not been
-    verified against a live fetch (automated access to it is blocked for
-    testing purposes), so this parser uses flexible, best-effort patterns
-    rather than one confirmed exact layout. Returns None on ANY failure
-    (network error, unexpected page structure, etc.) -- callers must treat
-    None as "could not auto-verify" and fall back to manual admin review,
-    never as a rejection.
-    """
+    def handle_starttag(self, tag, attrs):
+        if tag.lower() == 'td':
+            self.in_td = True
+            self.current = []
+
+    def handle_data(self, data):
+        if self.in_td:
+            self.current.append(data)
+
+    def handle_endtag(self, tag):
+        if tag.lower() == 'td' and self.in_td:
+            text = re.sub(r'\s+', ' ', ''.join(self.current)).strip()
+            self.cells.append(text)
+            self.in_td = False
+            self.current = []
+
+
+def _normalize_phone(value):
+    return re.sub(r'\D', '', str(value or ''))
+
+
+def _last4(value):
+    digits = _normalize_phone(value)
+    return digits[-4:] if len(digits) >= 4 else ''
+
+
+def fetch_telebirr_receipt(receipt_no):
+    """Fetch the official Telebirr receipt and extract stable table fields."""
     url = f"https://transactioninfo.ethiotelecom.et/receipt/{receipt_no}"
     req = urllib.request.Request(
         url,
@@ -233,31 +253,76 @@ def fetch_telebirr_receipt(receipt_no):
         log.warning(f"Receipt fetch failed for {receipt_no}: {e}")
         return None
 
-    amount_match = re.search(r"([\d,]+(?:\.\d+)?)\s*(?:ETB|Birr|ብር)", html, re.IGNORECASE)
-    if not amount_match:
-        log.warning(f"Receipt page for {receipt_no} fetched but amount not found -- page structure may differ from expected")
-        return None
+    parser = _TelebirrReceiptTDParser()
     try:
-        amount = float(amount_match.group(1).replace(",", ""))
-    except ValueError:
+        parser.feed(html)
+        parser.close()
+    except Exception as e:
+        log.warning(f"Receipt HTML parse failed for {receipt_no}: {e}")
+
+    raw_cells = parser.cells
+    cells = [re.sub(r'\s+', '', c).lower() for c in raw_cells]
+    labels = {
+        'credited_name': 'creditedpartyname',
+        'credited_phone': 'creditedpartyaccountno.',
+        'status': 'transactionstatus',
+        'receipt': 'receiptno.',
+        'date': 'paymentdate',
+        'settled_amount': 'settledamount',
+        'total_amount': 'totalamountpaid',
+    }
+    fields = {}
+    for idx, cell in enumerate(cells):
+        for key, label in labels.items():
+            if cell == label or label in cell:
+                if idx + 1 < len(raw_cells):
+                    fields[key] = raw_cells[idx + 1].strip()
+                break
+
+    # Prefer the official settled amount field; fall back to total amount and
+    # finally the old text regex for older/different receipt layouts.
+    amount = None
+    for key in ('settled_amount', 'total_amount'):
+        value = fields.get(key, '')
+        match = re.search(r'([\d,]+(?:\.\d+)?)', value)
+        if match:
+            try:
+                amount = float(match.group(1).replace(',', ''))
+                break
+            except ValueError:
+                pass
+    if amount is None:
+        amount_match = re.search(r'([\d,]+(?:\.\d+)?)\s*(?:ETB|Birr|ብር)', html, re.IGNORECASE)
+        if amount_match:
+            try:
+                amount = float(amount_match.group(1).replace(',', ''))
+            except ValueError:
+                pass
+    if amount is None:
+        log.warning(f"Receipt page for {receipt_no} fetched but amount not found")
         return None
 
-    # Every phone-like number on the page (there may be more than one --
-    # sender and recipient both appear). The caller cross-checks these
-    # against our own business numbers; if we can't find ANY, the caller
-    # must NOT assume the recipient is us -- see the fraud-prevention note
-    # at the call site.
-    all_phones = re.findall(r"(?:251)?0?9\d{8}", html)
+    # The old regex only accepted fully numeric phones. Official receipts can
+    # expose masked values such as 2519****9106, so retain masked values too.
+    all_phones = []
+    if fields.get('credited_phone'):
+        all_phones.append(fields['credited_phone'])
+    all_phones.extend(re.findall(r'(?:251|0)?9\d[\d*\s().-]{6,14}\d{2,4}', html))
+    all_phones.extend(re.findall(r'(?:251|0)?9\d\*{2,8}\d{2,4}', html))
 
-    # Transaction date/time, if present on the page, so the caller can
-    # reject a receipt that isn't actually recent (prevents someone reusing
-    # an old or leaked receipt number well after the fact).
-    date_match = re.search(r"(\d{1,2}[/-]\d{1,2}[/-]\d{4}[,\s]+\d{1,2}:\d{2}(?::\d{2})?)", html)
+    date_text = fields.get('date')
+    if not date_text:
+        date_match = re.search(r'(\d{1,2}[/-]\d{1,2}[/-]\d{4}[,\s]+\d{1,2}:\d{2}(?::\d{2})?)', html)
+        date_text = date_match.group(1) if date_match else None
 
     return {
-        "amount": amount,
-        "all_phones": all_phones,
-        "date_text": date_match.group(1) if date_match else None,
+        'amount': amount,
+        'all_phones': all_phones,
+        'credited_phone': fields.get('credited_phone', ''),
+        'credited_name': fields.get('credited_name', ''),
+        'status': fields.get('status', ''),
+        'receipt_no': fields.get('receipt') or receipt_no,
+        'date_text': date_text,
     }
 
 
@@ -627,26 +692,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        # Atomically check-and-reserve this receipt/transaction ID in a single
-        # Firebase transaction, so two near-simultaneous submissions of the
-        # same receipt (whether from this player double-tapping or two
-        # different players) can never both slip through -- only whichever
-        # one wins the race gets reserved, and the loser is told it's already
-        # used.
-        already_used_holder = {"already_used": False}
-
-        def reserve(current):
-            if current:
-                already_used_holder["already_used"] = True
-                return current  # no-op -- leave the existing reservation as-is
-            return True
-
-        used_deposit_ids_ref.child(receipt_no).transaction(reserve)
-
-        if already_used_holder["already_used"]:
-            log.info(f"Deposit duplicate for user {user_id}: receipt/txn_id={receipt_no} already reserved")
+        # Only reject a receipt that has already been successfully reserved.
+        # We reserve it atomically after verification, so a temporary receipt-page
+        # delay cannot make a genuine deposit look like a duplicate on retry.
+        if used_deposit_ids_ref.child(receipt_no).get():
+            log.info(f"Deposit duplicate for user {user_id}: receipt/txn_id={receipt_no} already used")
             await update.message.reply_text(
-                "🚫 ይህ የደረሰኝ ቁጥር (transaction ID) ቀድሞ ጥቅም ላይ ውሏል። እያንዳንዱ ደረሰኝ አንድ ጊዜ ብቻ ጥቅም ላይ ሊውል ይችላል፡፡\n\n"
+                "🚫 ይህ የደረሰኝ ቁጥር (transaction ID) ቀድሞ ጥቅም ላይ ውሏል። እያንዳንዱ ደረሰኝ አንድ ጊዜ ብቻ ጥቅም ላይ ሊውል ይችላል።\n\n"
                 f"❓ለድጋፍ @{SUPPORT_USERNAME} ላይ ይፃፉልን"
             )
             return
@@ -675,26 +727,32 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if receipt:
             amount_ok = stated_amount is not None and abs(receipt["amount"] - float(stated_amount)) <= 0.01
 
-            # Fraud prevention: the recipient MUST be verified as one of our
-            # own business numbers. If we can't find any phone number on the
-            # page at all, that is NOT treated as "assume it's fine" -- a
-            # real Telebirr receipt paid to someone else entirely would
-            # otherwise slip through auto-approval as long as the amount
-            # happened to match. An unverifiable recipient always falls back
-            # to manual admin review instead of auto-crediting.
-            our_last4s = {n["phone"][-4:] for n in TELEBIRR_NUMBERS}
+            # Verify the CREDITED PARTY against the exact Telebirr number selected
+            # for this deposit. Masked receipt numbers are matched by last 4 digits.
+            expected_last4 = _last4(data.get("payToPhone", ""))
             found_phones = receipt.get("all_phones") or []
-            phone_ok = any(p[-4:] in our_last4s for p in found_phones)
+            phone_ok = bool(expected_last4 and any(_last4(p) == expected_last4 for p in found_phones))
 
-            # Fraud prevention: the transaction must be recent. If the page
-            # gives us a date/time, reject anything older than 60 minutes --
-            # this stops someone reusing an old or leaked receipt number.
-            # If we can't parse a date at all, we don't block on it (this is
-            # a bonus defense-in-depth check, not the primary gate).
+            expected_name = re.sub(r"\s+", "", str(data.get("payToName", ""))).lower()
+            credited_name = re.sub(r"\s+", "", str(receipt.get("credited_name", ""))).lower()
+            name_ok = bool(expected_name and credited_name and expected_name in credited_name)
+            recipient_ok = phone_ok or name_ok
+
+            # If status exists, it must look successful. Missing status is allowed
+            # because receipt variants do not all expose that field.
+            status_text = str(receipt.get("status", "")).lower().strip()
+            status_ok = (not status_text) or any(
+                word in status_text for word in ("success", "successful", "completed", "ተሳክቷል", "ተሳካ")
+            )
+
             freshness_ok = True
             if receipt.get("date_text"):
                 parsed_dt = None
-                for fmt in ("%d/%m/%Y, %H:%M:%S", "%d/%m/%Y %H:%M:%S", "%d-%m-%Y %H:%M:%S", "%d/%m/%Y, %H:%M", "%d/%m/%Y %H:%M"):
+                for fmt in (
+                    "%d/%m/%Y, %H:%M:%S", "%d/%m/%Y %H:%M:%S", "%d-%m-%Y %H:%M:%S",
+                    "%d/%m/%Y, %H:%M", "%d/%m/%Y %H:%M", "%d/%m/%y %H:%M:%S",
+                    "%d/%m/%y %H:%M",
+                ):
                     try:
                         parsed_dt = datetime.strptime(receipt["date_text"].strip(), fmt)
                         break
@@ -702,21 +760,19 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         continue
                 if parsed_dt:
                     age_seconds = (datetime.now() - parsed_dt).total_seconds()
-                    freshness_ok = -300 <= age_seconds <= 3600  # allow a little clock skew, cap at 1 hour old
+                    freshness_ok = -300 <= age_seconds <= 3600
 
-            # Fraud-hardening: even if everything else checks out, cap how
-            # large an auto-approved deposit can be -- large sums get routed
-            # to support instead, as an extra layer of caution.
             ceiling_ok = receipt["amount"] <= AUTO_APPROVE_MAX_AMOUNT
-
-            verified = amount_ok and phone_ok and freshness_ok and ceiling_ok
+            verified = amount_ok and recipient_ok and status_ok and freshness_ok and ceiling_ok
             verified_amount = receipt["amount"]
             if not verified:
                 log.info(
                     f"Auto-verify failed for {receipt_no}: amount_ok={amount_ok} "
-                    f"phone_ok={phone_ok} freshness_ok={freshness_ok} ceiling_ok={ceiling_ok} "
-                    f"receipt={receipt} stated={stated_amount}"
+                    f"phone_ok={phone_ok} name_ok={name_ok} recipient_ok={recipient_ok} "
+                    f"status_ok={status_ok} freshness_ok={freshness_ok} ceiling_ok={ceiling_ok} "
+                    f"receipt={receipt} stated={stated_amount} expected_phone={data.get('payToPhone')} expected_name={data.get('payToName')}"
                 )
+
         else:
             log.info(f"Auto-verify: could not fetch/parse receipt page for {receipt_no}")
 
@@ -724,6 +780,22 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["flow_data"] = {}
 
         if verified:
+            reserved_holder = {"duplicate": False}
+
+            def reserve_after_verify(current):
+                if current:
+                    reserved_holder["duplicate"] = True
+                    return current
+                return {"user_id": user_id, "amount": verified_amount, "reserved_at": int(time.time())}
+
+            used_deposit_ids_ref.child(receipt_no).transaction(reserve_after_verify)
+            if reserved_holder["duplicate"]:
+                log.info(f"Deposit became duplicate during verification race: {receipt_no}")
+                await update.message.reply_text(
+                    "🚫 ይህ የደረሰኝ ቁጥር ቀድሞ ተጠቅመዋል። ሌላ ደረሰኝ ይጠቀሙ።"
+                )
+                return
+
             success, err = _credit_deposit_wallet(user_id, verified_amount)
             if success:
                 key = deposits_ref.push({
