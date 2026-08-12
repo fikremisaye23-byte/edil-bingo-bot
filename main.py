@@ -757,21 +757,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return current
 
         result = _wallet_ref(user_id_str).transaction(deduct)
-
-        # Only create a withdrawal request if the balance deduction actually
-        # succeeded. If the balance changed between the initial check and the
-        # transaction, deduct() returns the unchanged wallet and no request
-        # should be created.
-        committed_main = (result or {}).get("main", 0)
-        if committed_main > wallet.get("main", 0) - amount:
-            context.user_data["flow"] = None
-            context.user_data["flow_data"] = {}
-            await update.message.reply_text(
-                "⚠️ የእርስዎ ባላንስ በዚህ መካከል ተቀይሯል። "
-                "እባክዎ የቀረውን ባላንስ እንደገና ያረጋግጡና ይሞክሩ።"
-            )
-            return
-
+        # python-firebase-admin's transaction() returns the committed value
         key = withdrawals_ref.push({
             "by": user_id_str,
             "name": data.get("name", "Player"),
