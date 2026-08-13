@@ -45,7 +45,7 @@ from telegram.ext import (
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 FIREBASE_SERVICE_ACCOUNT_JSON = os.environ.get("FIREBASE_SERVICE_ACCOUNT_JSON")
 ADMIN_CHAT_ID = 7078415767
-MINI_APP_URL = "https://fikremisaye23-byte.github.io/bingo-game/"
+MINI_APP_URL = "https://fikremisaye23-byte.github.io/bingo-game/?v=2"
 SUPPORT_USERNAME = "Temerachibingosupport"
 FIREBASE_DATABASE_URL = "https://edil-bingo-default-rtdb.firebaseio.com"
 
