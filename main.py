@@ -1,5 +1,5 @@
 """
-Temerachi Bingo - Admin Bot (Production Version - FIXED)
+Temerachi Bingo - Admin Bot (Production Version - Fixed)
 ---------------------------------------------
 የተሻሻለ ስሪት ከተሻሻለ የገንዘብ አያያዝ፣ የተሻሻለ ስህተት አያያዝ እና ከindex.html ጋር የተጣጣመ
 """
@@ -137,42 +137,6 @@ def _debit_withdrawal(user_id: str, amount: float) -> Tuple[bool, Optional[str]]
 
 def _refund_withdrawal(user_id: str, amount: float) -> Tuple[bool, Optional[str]]:
     return _update_wallet(user_id, main_delta=amount)
-
-
-# ============================================================
-# ⭐ FIXED: Reserve Deposit ID (Added this function)
-# ============================================================
-def _reserve_deposit_id(receipt_no: str) -> Tuple[bool, Optional[str]]:
-    """
-    Reserve a deposit ID to prevent duplicate submissions.
-    Returns: (success, error_message)
-    """
-    if not receipt_no:
-        return False, "No receipt number provided"
-    
-    try:
-        result = used_deposit_ids_ref.child(receipt_no).transaction(
-            lambda current: True if current is None else current
-        )
-        
-        if result is None:
-            return False, "Transaction failed"
-        
-        # If committed and the value was None (new), it's reserved
-        if result.committed:
-            # Check if it was newly created or already existed
-            if result.snapshot is not None:
-                # It was created, so it's reserved
-                return True, None
-            else:
-                # It already existed
-                return False, "Deposit ID already used"
-        else:
-            return False, "Could not reserve deposit ID"
-            
-    except Exception as e:
-        log.error(f"Error reserving deposit ID {receipt_no}: {e}")
-        return False, str(e)
 
 
 # ============================================================
@@ -681,11 +645,6 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 log.warning(f"Could not notify user of deposit approval: {e}")
                 
         else:
-            # ✅ FIXED: Release the reserved ID when rejected
-            txn_id = record.get("txnId")
-            if txn_id:
-                used_deposit_ids_ref.child(txn_id).delete()
-            
             pending_deposits_ref.child(key).update({
                 "status": "rejected",
                 "rejected_at": datetime.now().isoformat(),
@@ -864,13 +823,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        # ⭐ FIXED: Reserve the ID FIRST before anything else
-        reserved, reserve_err = _reserve_deposit_id(receipt_no)
-        
-        if not reserved:
+        if used_deposit_ids_ref.child(receipt_no).get():
             await update.message.reply_text(
-                f"🚫 ይህ የደረሰኝ ቁጥር ቀድሞ ጥቅም ላይ ውሏል ወይም በሂደት ላይ ነው።\n\n"
-                f"📋 የደረሰኝ ቁጥር: {receipt_no}\n\n"
+                "🚫 ይህ የደረሰኝ ቁጥር (transaction ID) ቀድሞ ጥቅም ላይ ውሏል።\n\n"
                 f"❓ለድጋፍ @{SUPPORT_USERNAME} ላይ ይፃፉልን"
             )
             return
@@ -924,6 +879,23 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["flow_data"] = {}
 
         if verified:
+            already_used_holder = {"already_used": False}
+
+            def reserve_after_verify(current):
+                if current:
+                    already_used_holder["already_used"] = True
+                    return current
+                return True
+
+            used_deposit_ids_ref.child(receipt_no).transaction(reserve_after_verify)
+
+            if already_used_holder["already_used"]:
+                await update.message.reply_text(
+                    "🚫 ይህ የደረሰኝ ቁጥር ቀድሞ ጥቅም ላይ ውሏል።\n\n"
+                    f"❓ለድጋፍ @{SUPPORT_USERNAME} ላይ ይፃፉልን"
+                )
+                return
+
             success, err = _credit_deposit_wallet(user_id, verified_amount)
             if success:
                 deposits_ref.push({
@@ -951,16 +923,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except Exception as e:
                     log.warning(f"Could not send admin notification: {e}")
                 return
-            else:
-                # If credit fails, release the reserved ID
-                used_deposit_ids_ref.child(receipt_no).delete()
-                await update.message.reply_text(
-                    f"❌ ዲፖዚት ማስገባት አልተቻለም፡ {err}\n\n"
-                    f"እባክዎ እንደገና ይሞክሩ ወይም @{SUPPORT_USERNAME} ያግኙ።"
-                )
-                return
 
-        # ⭐ FIXED: ID is already reserved, now send to admin
         pending_key = pending_deposits_ref.push({
             "by": user_id,
             "name": data.get("name", "Player"),
@@ -991,13 +954,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         except Exception as e:
             log.warning(f"Could not notify admin: {e}")
-            # If admin notification fails, release the ID
-            used_deposit_ids_ref.child(receipt_no).delete()
-            await update.message.reply_text(
-                f"❌ ዲፖዚት ጥያቄዎ ለአስተዳዳሪ መላክ አልተቻለም።\n\n"
-                f"እባክዎ እንደገና ይሞክሩ ወይም @{SUPPORT_USERNAME} ያግኙ።"
-            )
-            return
 
         await update.message.reply_text(
             f"⏳ የዲፖዚት ጥያቄዎ ለአስተዳዳሪ ተልኳል።\n"
