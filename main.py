@@ -1,24 +1,7 @@
 """
-Temerachi Bingo - Admin Bot (Replit version)
+Temerachi Bingo - Admin Bot (Production Version - Fixed)
 ---------------------------------------------
-Same as bot.py, but adjusted to run 24/7 on Replit, PLUS a native
-in-chat menu (Register / Check Balance / Deposit / Withdraw / Support /
-Instruction / Invite) so players can do everything without leaving the
-chat. "Play" still opens the Mini App, because the live bingo board
-(numbers being called, marking cells in real time) needs a real
-interactive screen that a Telegram chat can't render on its own.
-
-Setup on Replit:
-  1. Create a new Repl -> Python.
-  2. Upload this file, requirements_replit.txt (rename to requirements.txt).
-  3. In the Repl, open the "Secrets" (lock icon) tab and add:
-       BOT_TOKEN = your bot token
-       FIREBASE_SERVICE_ACCOUNT_JSON = the FULL content of your
-         serviceAccountKey.json file (paste the whole JSON as the value)
-  4. Press Run.
-  5. Copy the web preview URL Replit shows you, and add it to UptimeRobot
-     (https://uptimerobot.com, free) as an HTTP(s) monitor, checking every
-     5 minutes, so Replit keeps the Repl awake.
+የተሻሻለ ስሪት ከተሻሻለ የገንዘብ አያያዝ፣ የተሻሻለ ስህተት አያያዝ እና ከindex.html ጋር የተጣጣመ
 """
 
 import asyncio
@@ -32,6 +15,7 @@ import time
 import urllib.request
 import urllib.error
 from datetime import datetime
+from typing import Optional, Tuple, Dict, Any
 
 import firebase_admin
 import telegram
@@ -56,65 +40,116 @@ from telegram.ext import (
 )
 
 # ============================================================
-# Config (safe to leave as-is; the two secrets come from env vars)
+# Configuration
 # ============================================================
-BOT_TOKEN = os.environ["BOT_TOKEN"]
-FIREBASE_SERVICE_ACCOUNT_JSON = os.environ["FIREBASE_SERVICE_ACCOUNT_JSON"]
-ADMIN_CHAT_ID = 7078415767  # Fikr's Telegram ID -- only this account can approve/reject
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+FIREBASE_SERVICE_ACCOUNT_JSON = os.environ.get("FIREBASE_SERVICE_ACCOUNT_JSON")
+ADMIN_CHAT_ID = 7078415767
 MINI_APP_URL = "https://fikremisaye23-byte.github.io/bingo-game/"
 SUPPORT_USERNAME = "Temerachibingosupport"
 FIREBASE_DATABASE_URL = "https://edil-bingo-default-rtdb.firebaseio.com"
+
+if not BOT_TOKEN:
+    raise ValueError("BOT_TOKEN environment variable is required")
+if not FIREBASE_SERVICE_ACCOUNT_JSON:
+    raise ValueError("FIREBASE_SERVICE_ACCOUNT_JSON environment variable is required")
+
 # ============================================================
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
-# httpx logs full request URLs at INFO level, which would leak the bot token
-# (it's part of the URL). Silence it so the console never shows the token.
 logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("firebase_admin").setLevel(logging.WARNING)
 
-
-async def _safe_answer(query, *args, **kwargs):
-    """
-    Wrapper around query.answer() that swallows the "query is too old"
-    error Telegram raises when a callback query wasn't answered in time
-    (e.g. the bot was momentarily slow, or Render's free tier was waking
-    up from sleep). Without this, that single exception used to bubble
-    up unhandled and crash the whole bot process.
-    """
-    try:
-        await query.answer(*args, **kwargs)
-    except telegram.error.BadRequest as e:
-        log.warning(f"Could not answer callback query (likely expired): {e}")
-
-# ---- Firebase setup ----
+# ============================================================
+# Firebase Setup
+# ============================================================
 service_account_info = json.loads(FIREBASE_SERVICE_ACCOUNT_JSON)
 cred = credentials.Certificate(service_account_info)
 firebase_admin.initialize_app(cred, {"databaseURL": FIREBASE_DATABASE_URL})
 
 deposits_ref = db.reference("transactions/deposits")
 withdrawals_ref = db.reference("transactions/withdrawals")
-# Keeps track of Telebirr transaction IDs that have already been used for a
-# deposit, so the same confirmation SMS can't be submitted twice.
 used_deposit_ids_ref = db.reference("transactions/usedDepositIds")
+pending_deposits_ref = db.reference("transactions/pendingDeposits")
 
-# Fraud-hardening: throttle how often any one user can attempt a deposit
-# submission, so someone can't brute-force-spam the verification endpoint
-# (e.g. rapidly trying many receipt numbers hoping one happens to verify).
-# In-memory is fine here -- worst case a restart resets everyone's cooldown,
-# which is not a security issue, just occasionally more lenient.
+# ============================================================
+# Wallet Functions (FIXED)
+# ============================================================
+
+def _wallet_ref(user_id: str):
+    return db.reference(f"users/{user_id}/wallet")
+
+
+def _get_wallet(user_id: str) -> Dict[str, float]:
+    w = _wallet_ref(user_id).get()
+    if w is None:
+        _wallet_ref(user_id).set({"main": 0, "play": 0, "deposited": 0})
+        return {"main": 0, "play": 0, "deposited": 0}
+    return {
+        "main": w.get("main", 0),
+        "play": w.get("play", 0),
+        "deposited": w.get("deposited", 0)
+    }
+
+
+def _get_wallet_safe(user_id: str) -> Dict[str, float]:
+    try:
+        return _get_wallet(user_id)
+    except Exception as e:
+        log.error(f"Error getting wallet for {user_id}: {e}")
+        return {"main": 0, "play": 0, "deposited": 0}
+
+
+def _update_wallet(user_id: str, main_delta: float = 0, play_delta: float = 0, deposited_delta: float = 0) -> Tuple[bool, Optional[str]]:
+    wallet_ref = _wallet_ref(user_id)
+    
+    def update(current):
+        if current is None:
+            current = {"main": 0, "play": 0, "deposited": 0}
+        new_main = current.get("main", 0) + main_delta
+        new_play = current.get("play", 0) + play_delta
+        new_deposited = current.get("deposited", 0) + deposited_delta
+        if new_main < 0 or new_play < 0 or new_deposited < 0:
+            return current
+        current["main"] = new_main
+        current["play"] = new_play
+        current["deposited"] = new_deposited
+        return current
+    
+    try:
+        result = wallet_ref.transaction(update)
+        if result is None:
+            return False, "Transaction failed"
+        return True, None
+    except Exception as e:
+        log.error(f"Wallet update failed for {user_id}: {e}")
+        return False, str(e)
+
+
+def _credit_deposit_wallet(user_id: str, amount: float) -> Tuple[bool, Optional[str]]:
+    return _update_wallet(user_id, play_delta=amount, deposited_delta=amount)
+
+
+def _debit_withdrawal(user_id: str, amount: float) -> Tuple[bool, Optional[str]]:
+    return _update_wallet(user_id, main_delta=-amount)
+
+
+def _refund_withdrawal(user_id: str, amount: float) -> Tuple[bool, Optional[str]]:
+    return _update_wallet(user_id, main_delta=amount)
+
+
+# ============================================================
+# Rate Limiting
+# ============================================================
 _deposit_attempt_times = {}
 _deposit_attempt_lock = threading.Lock()
-DEPOSIT_RATE_LIMIT_MAX = 5       # attempts
-DEPOSIT_RATE_LIMIT_WINDOW = 600  # seconds (10 minutes)
-# Fraud-hardening: even a fully verified deposit above this amount is routed
-# to admin review instead of being auto-credited -- an extra layer of caution
-# for unusually large sums, in case the verification logic itself is ever
-# wrong or the page format changes in a way we haven't caught.
+DEPOSIT_RATE_LIMIT_MAX = 5
+DEPOSIT_RATE_LIMIT_WINDOW = 600
 AUTO_APPROVE_MAX_AMOUNT = 2000
 
 
-def _deposit_rate_limited(user_id):
-    """Returns True if this user should be blocked for now (too many recent attempts)."""
+def _deposit_rate_limited(user_id: str) -> bool:
     now = time.time()
     with _deposit_attempt_lock:
         recent = [t for t in _deposit_attempt_times.get(user_id, []) if now - t < DEPOSIT_RATE_LIMIT_WINDOW]
@@ -123,10 +158,9 @@ def _deposit_rate_limited(user_id):
         return len(recent) > DEPOSIT_RATE_LIMIT_MAX
 
 
-# Same three receiving numbers, and the same round-robin rotation counter
-# (deposits/rotationIndex), as the Mini App -- so whichever channel a user
-# deposits from, the numbers rotate together instead of each keeping its
-# own separate count.
+# ============================================================
+# Telebirr Functions
+# ============================================================
 TELEBIRR_NUMBERS = [
     {"phone": "0923160399", "name": "Fikre"},
     {"phone": "0900619106", "name": "Fikr"},
@@ -134,14 +168,10 @@ TELEBIRR_NUMBERS = [
 ]
 
 
-def get_next_telebirr_number():
+def get_next_telebirr_number() -> Dict[str, str]:
     rotation_ref = db.reference("deposits/rotationIndex")
-
-    def increment(current):
-        return (current + 1) if isinstance(current, int) else 0
-
     try:
-        idx = rotation_ref.transaction(increment)
+        idx = rotation_ref.transaction(lambda current: (current + 1) if isinstance(current, int) else 0)
         if not isinstance(idx, int):
             idx = 0
     except Exception:
@@ -149,146 +179,174 @@ def get_next_telebirr_number():
     return TELEBIRR_NUMBERS[idx % len(TELEBIRR_NUMBERS)]
 
 
-# Parses a genuine Telebirr confirmation SMS, e.g.:
-#   "ውድFikre ወደ Fikre Misaye(2519****9106) 20.00 ብር በ 06/08/2026 00:42:19 "
-#   "ልከዋል። የሂሳብ እንቅስቃሴ ቁጥርዎ DH69K37KI1 ነዉ። ..."
-# Returns a dict with amount / phone_last4 / txn_id, or None if the text
-# doesn't look like a real Telebirr SMS at all.
-def parse_telebirr_sms(text):
-    # Normalise whitespace to make regexes simpler
-    txt = (text or "").strip()
-
-    # Amount: collect EVERY monetary figure in the message (not just the
-    # first), regardless of whether the SMS wording is Amharic ("ብር") or
-    # English ("Birr"/"ETB") -- Telebirr sends in whichever language the
-    # recipient's SIM/handset is set to, and earlier only matching "ብር"
-    # silently broke everything for English-language messages.
-    amount_matches = re.findall(r"([\d,]+(?:\.\d+)?)\s*(?:ብር|Birr|ETB)", txt, re.IGNORECASE)
-
-    # Phone (last 4 digits of the masked sender number): informational only.
-    # Support formats like (2519****9106), 09****9106, or plain numbers.
-    phone_match = re.search(r"(?:251)?0?9\*+?(\d{2,4})", txt)
-
-    # Transaction ID: try several common patterns (Amharic phrasing first,
-    # then common English phrases) and finally a generic alphanumeric
-    # fallback. Accept lowercase/uppercase and hyphens. Strip punctuation
-    # around the captured token to avoid trailing punctuation/errors.
-    txn_match = (
-        re.search(r"ቁጥርዎ\s*([A-Za-z0-9\-]{4,30})\s*ነ[ዉው]", txt)
-        or re.search(
-            r"(?:transaction\s*(?:number|id)|txn\s*id|ref(?:erence)?\s*(?:no\.?|number)?)\s*(?:is|:)?\s*([A-Za-z0-9\-]{4,30})",
-            txt, re.IGNORECASE,
-        )
-        or re.search(r"\b([A-Za-z0-9\-]{6,30})\b", txt, re.IGNORECASE)
-    )
-
-    if not txn_match:
+def parse_telebirr_sms_improved(text: str) -> Optional[Dict[str, Any]]:
+    if not text or len(text.strip()) < 10:
         return None
-
-    # Sanitize captured values
-    raw_txn = txn_match.group(1).strip()
-    # strip common trailing punctuation that might get captured
-    txn_id = re.sub(r"^[^A-Za-z0-9]+|[^A-Za-z0-9]+$", "", raw_txn)
-
+    
+    amount_patterns = [
+        r'([\d,]+(?:\.\d+)?)\s*ብር',
+        r'([\d,]+(?:\.\d+)?)\s*ETB',
+        r'([\d,]+(?:\.\d+)?)\s*Birr',
+        r'([\d,]+(?:\.\d+)?)\s*Br',
+        r'amount[:\s]*([\d,]+(?:\.\d+)?)',
+    ]
+    
     amounts = []
-    for raw in amount_matches:
-        try:
-            amounts.append(float(raw.replace(",", "")))
-        except ValueError:
-            continue
-
+    for pattern in amount_patterns:
+        matches = re.findall(pattern, text, re.IGNORECASE)
+        for match in matches:
+            try:
+                amt = float(match.replace(',', ''))
+                amounts.append(amt)
+            except ValueError:
+                continue
+    
+    phone_patterns = [
+        r'\(?251\d\*+(\d{2,4})\)?',
+        r'0?9\d{8}',
+        r'2519\d{8}',
+    ]
+    phone_match = None
+    for pattern in phone_patterns:
+        match = re.search(pattern, text)
+        if match:
+            phone_match = match
+            break
+    
+    txn_patterns = [
+        r'ቁጥርዎ\s*(\S+)\s*ነ[ዉው]',
+        r'የሂሳብ እንቅስቃሴ ቁጥርዎ\s*(\S+)',
+        r'Transaction\s*(?:ID|No|Number)[:\s]*([A-Z0-9]+)',
+        r'Ref(?:erence)?[:\s]*([A-Z0-9]+)',
+        r'([A-Z0-9]{8,14})\s*(?:ነዉ|ነው|is|$)',
+    ]
+    
+    txn_match = None
+    for pattern in txn_patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            txn_match = match
+            break
+    
+    receipt_match = re.search(r'transactioninfo\.ethiotelecom\.et/receipt/([A-Za-z0-9]+)', text)
+    
+    if not amounts and not txn_match:
+        return None
+    
     return {
         "amounts": amounts,
-        "phone_last4": phone_match.group(1) if phone_match else "",
-        "txn_id": txn_id,
+        "phone": phone_match.group(1) if phone_match else "",
+        "txn_id": txn_match.group(1) if txn_match else None,
+        "receipt_id": receipt_match.group(1) if receipt_match else None,
+        "raw_text": text,
     }
 
 
-def fetch_telebirr_receipt(receipt_no):
-    """
-    Fetch Ethio Telecom's own official receipt page for a transaction and
-    extract the amount + recipient phone from it. This is our automatic
-    verification layer. ALWAYS return a dict with debug info on failure.
-    """
+def fetch_telebirr_receipt_improved(receipt_no: str) -> Optional[Dict[str, Any]]:
     url = f"https://transactioninfo.ethiotelecom.et/receipt/{receipt_no}"
-    req = urllib.request.Request(
-        url,
-        headers={
-            # Use a realistic browser UA and accept headers so the site
-            # is less likely to return a minimal/blocked page.
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
-            ),
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.5",
-        },
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            status = getattr(resp, "status", None) or 200
-            html = resp.read().decode("utf-8", errors="ignore")
-    except Exception as e:
-        log.warning(f"Receipt fetch failed for {receipt_no}: {e}")
-        return {"ok": False, "debug": f"fetch error: {e!r}"}
+    
+    user_agents = [
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    ]
+    
+    for ua in user_agents:
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": ua})
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                html = resp.read().decode("utf-8", errors="ignore")
+                break
+        except Exception as e:
+            log.warning(f"User-Agent {ua[:30]}... failed: {e}")
+            continue
+    else:
+        log.warning(f"All User-Agents failed for {receipt_no}")
+        return None
+    
+    result = {"amount": None, "all_phones": [], "date_text": None, "status": "unknown"}
+    
+    amount_patterns = [
+        r'([\d,]+(?:\.\d+)?)\s*(?:ETB|Birr|ብር)',
+        r'Amount[:\s]*([\d,]+(?:\.\d+)?)',
+        r'ብር[:\s]*([\d,]+(?:\.\d+)?)',
+        r'([\d,]+(?:\.\d+)?)\s*ETB',
+    ]
+    
+    for pattern in amount_patterns:
+        match = re.search(pattern, html, re.IGNORECASE)
+        if match:
+            try:
+                result["amount"] = float(match.group(1).replace(",", ""))
+                break
+            except ValueError:
+                continue
+    
+    phone_patterns = [
+        r'(?:251)?0?9\d{8}',
+        r'\+\d{1,3}0?9\d{8}',
+    ]
+    all_phones = []
+    for pattern in phone_patterns:
+        phones = re.findall(pattern, html)
+        all_phones.extend(phones)
+    result["all_phones"] = list(set(all_phones))
+    
+    date_patterns = [
+        r'(\d{1,2}[/-]\d{1,2}[/-]\d{4}[,\s]+\d{1,2}:\d{2}(?::\d{2})?)',
+        r'(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})',
+        r'(\d{1,2}/\d{1,2}/\d{4}\s+\d{1,2}:\d{2})',
+    ]
+    for pattern in date_patterns:
+        match = re.search(pattern, html)
+        if match:
+            result["date_text"] = match.group(1)
+            break
+    
+    if "successful" in html.lower() or "completed" in html.lower() or "confirmed" in html.lower():
+        result["status"] = "success"
+    elif "failed" in html.lower() or "rejected" in html.lower():
+        result["status"] = "failed"
+    else:
+        result["status"] = "unknown"
+    
+    if result["amount"] is None:
+        log.warning(f"Could not extract amount from receipt page for {receipt_no}")
+        return None
+    
+    return result
 
-    # Sometimes the site wraps currency in non-breaking spaces or HTML tags;
-    # make the regex tolerant by allowing HTML entities and tags between the
-    # number and the currency word.
-    amount_match = re.search(r"([\d,]+(?:\.\d+)?)(?:\s|&nbsp;|<[^>]*>){0,6}(?:ETB|Birr|ብር)", html, re.IGNORECASE)
-    if not amount_match:
-        snippet = re.sub(r"\s+", " ", html).strip()[:1500]
-        log.warning(f"Receipt page for {receipt_no} fetched (HTTP {status}) but amount not found")
-        return {"ok": False, "debug": f"HTTP {status}, amount not found. Page snippet: {snippet}"}
-    try:
-        amount = float(amount_match.group(1).replace(",", ""))
-    except ValueError:
-        return {"ok": False, "debug": f"HTTP {status}, amount text unparseable: {amount_match.group(1)!r}"}
 
-    # Every phone-like number on the page (there may be more than one).
-    # Accept formats both with and without country code.
-    all_phones = re.findall(r"(?:251)?0?9\d{8}", html)
-
-    # Transaction date/time, if present on the page, so the caller can
-    # reject a receipt that isn't actually recent.
-    date_match = re.search(r"(\d{1,2}[/-]\d{1,2}[/-]\d{4}[,\s]+\d{1,2}:\d{2}(?::\d{2})?)", html)
-
-    return {
-        "ok": True,
-        "amount": amount,
-        "all_phones": all_phones,
-        "date_text": date_match.group(1) if date_match else None,
-        "debug": None,
-    }
-
-
-def fetch_telebirr_receipt_with_retry(receipt_no, max_wait_seconds=90, poll_interval=7):
-    """
-    Keep polling Ethio Telecom's receipt page for up to max_wait_seconds.
-    """
+def fetch_telebirr_receipt_with_retry_improved(
+    receipt_no: str, max_wait_seconds: int = 120, poll_interval: int = 5
+) -> Optional[Dict[str, Any]]:
     deadline = time.time() + max_wait_seconds
     attempt = 0
-    last_result = {"ok": False, "debug": "no attempts made"}
     while True:
         attempt += 1
-        last_result = fetch_telebirr_receipt(receipt_no)
-        if last_result.get("ok"):
-            return last_result
+        log.info(f"Fetching receipt {receipt_no} attempt {attempt}")
+        receipt = fetch_telebirr_receipt_improved(receipt_no)
+        if receipt is not None:
+            log.info(f"Receipt {receipt_no} found on attempt {attempt}")
+            return receipt
         if time.time() >= deadline:
-            log.info(f"Giving up on receipt {receipt_no} after {attempt} attempts (~{max_wait_seconds}s budget)")
-            return last_result
+            log.info(f"Giving up on receipt {receipt_no} after {attempt} attempts")
+            return None
         time.sleep(poll_interval)
 
 
+# ============================================================
+# Keyboard Definitions
+# ============================================================
 INSTRUCTIONS_TEXT = """🃏 መጫወቻ ካርድ
 
 1. ጨዋታውን ለመጀመር ከሚመጣልን ከ1-600 የካርድ መምረጫ ቦርድ ውስጥ እስከ 2 የመጫወቻ ካርድ (ካርቴላ) መምረጥ ይቻላል።
 
-2. የካርድ መምረጫ ቦርድ ላይ በቀይ ቀለም የተመረጡ ቁጥሮች የሚያሳዩት መጫወቻ ካርዱ (ካርቴላው) በሌላ ተጫዋች መመረጡን �[...]
+2. የካርድ መምረጫ ቦርድ ላይ በቀይ ቀለም የተመረጡ ቁጥሮች የሚያሳዩት መጫወቻ ካርዱ (ካርቴላው) በሌላ ተጫዋች መመረጡን ነው።
 
 3. የመጫወቻ ካርዱን (ካርቴላውን) ሲመርጡት ከታች የሚይዛቸውን ቁጥሮች ያሳያል።
 
-4. ወደ ጨዋታው ለመግባት የሚፈልጉትን የመጫወቻ ካርድ (ካርቴላ) ሲመርጡና ለምዝገባ የተሰጠው ሰኮንድ ዜሮ ሲሆን ቀጥታ ወ��[...]
+4. ወደ ጨዋታው ለመግባት የሚፈልጉትን የመጫወቻ ካርድ (ካርቴላ) ሲመርጡና ለምዝገባ የተሰጠው ሰኮንድ ዜሮ ሲሆን ቀጥታ ወደ ጨዋታ ያስገባል።
 
 🎮 ጨዋታ እንዴት ይካሄዳል
 
@@ -296,8 +354,796 @@ INSTRUCTIONS_TEXT = """🃏 መጫወቻ ካርድ
 
 2. ጨዋታው ሲጀምር ሲስተሙ ከ1 እስከ 75 ያሉ ቁጥሮችን Randomly መጥራት ይጀምራል።
 
-3. ሲስተሙ ከሚጠራቸው ቁጥሮች ውስጥ በራስዎ የመጫወቻ ካርድ (ካርቴላ) ላይ ካሉ በመምረጥ ያጥቁሩ። በራሱ እንዲያጠቁር ከፈለ�[...]
+3. ሲስተሙ ከሚጠራቸው ቁጥሮች ውስጥ በራስዎ የመጫወቻ ካርድ (ካርቴላ) ላይ ካሉ በመምረጥ ያጥቁሩ። በራሱ እንዲያጠቁር ከፈለጉ Automatic የሚለውን ያብሩት።
 
-🎮 ጨዋታ እንዴት ይካሄዳል
+🏆 አሸናፊ የሚሆኑባቸው መንገዶች
 
-... (truncated for brevity in this message)
+1. መጫወቻ ካርድ (ካርቴላ) ላይ የተጠቆሩት ቁጥሮች፦
+   • ወደጎን ወይም ወደታች መስመር ከሰሩ
+   • ወደሁለቱም አግዳሚ መስመር ከሰሩ
+   • አራቱ ማእዘናት (ኮርነር) ከተጠሩ አሸናፊ ይሆናሉ።
+
+2. ሁለት ወይም ከዚያ በላይ ተጫዋቾች እኩል ቢያሸንፉ አጠቃላይ ደራሹ ብር ለአሸናፊዎች እኩል ይካፈላል።"""
+
+
+def main_menu_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🎮 Play", callback_data="menu:play"),
+         InlineKeyboardButton("📝 Register", callback_data="menu:register")],
+        [InlineKeyboardButton("💰 Check Balance", callback_data="menu:balance"),
+         InlineKeyboardButton("🪙 Deposit", callback_data="menu:deposit")],
+        [InlineKeyboardButton("🆘 Contact Support", callback_data="menu:support"),
+         InlineKeyboardButton("📖 Instruction", callback_data="menu:instruction")],
+        [InlineKeyboardButton("💸 Withdraw", callback_data="menu:withdraw"),
+         InlineKeyboardButton("🔗 Invite", callback_data="menu:invite")],
+    ])
+
+
+def deposit_payment_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Telebirr", callback_data="deppay:telebirr")],
+        [InlineKeyboardButton("Cancel", callback_data="deppay:cancel")],
+    ])
+
+
+def admin_deposit_keyboard(deposit_key: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Approve", callback_data=f"approve:deposit:{deposit_key}"),
+            InlineKeyboardButton("❌ Reject", callback_data=f"reject:deposit:{deposit_key}"),
+        ]
+    ])
+
+
+# ============================================================
+# Flask Keep-Alive Server
+# ============================================================
+flask_app = Flask(__name__)
+
+
+@flask_app.route("/")
+def home():
+    return "Temerachi Bingo bot is running."
+
+
+@flask_app.route("/health")
+def health():
+    return {"status": "healthy", "timestamp": datetime.now().isoformat()}
+
+
+def run_web_server():
+    flask_app.run(host="0.0.0.0", port=8080)
+
+
+# ============================================================
+# Helper Functions
+# ============================================================
+async def _safe_answer(query, *args, **kwargs):
+    try:
+        await query.answer(*args, **kwargs)
+    except telegram.error.BadRequest as e:
+        log.warning(f"Could not answer callback query (likely expired): {e}")
+
+
+async def _run_menu_action(action: str, reply_target, user, context):
+    user_id = str(user.id)
+    name = (user.first_name or "") + (" " + user.last_name if user.last_name else "")
+    name = name.strip() or "Player"
+
+    if action == "play":
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🎮 Open Game", web_app=WebAppInfo(url=MINI_APP_URL))]
+        ])
+        await reply_target.reply_text(
+            "Choose your stake to play:",
+            reply_markup=keyboard,
+        )
+
+    elif action == "register":
+        user_record = db.reference(f"users/{user_id}").get() or {}
+        if user_record.get("registered"):
+            await reply_target.reply_text("❗ You already have registered. /play")
+            return
+
+        contact_keyboard = ReplyKeyboardMarkup(
+            [[KeyboardButton("📱 Share Contact", request_contact=True)]],
+            resize_keyboard=True,
+            one_time_keyboard=True,
+        )
+        await reply_target.reply_text(
+            "📝 ለምዝገባ እባክዎ ስልክ ቁጥርዎን ያጋሩ:",
+            reply_markup=contact_keyboard,
+        )
+
+    elif action == "balance":
+        wallet = _get_wallet_safe(user_id)
+        user_record = db.reference(f"users/{user_id}").get() or {}
+        display_name = user_record.get("name", name)
+        phone = user_record.get("phone", "አልተመዘገበም")
+        main_bal = wallet.get("main", 0)
+        play_bal = wallet.get("play", 0)
+        deposited_bal = wallet.get("deposited", 0)
+        coin_total = main_bal + play_bal
+        
+        await reply_target.reply_text(
+            "💼 Account Info\n\n"
+            "```\n"
+            f"Name:               {display_name}\n"
+            f"Phone:              {phone}\n"
+            f"Main wallet:        {main_bal:.2f}\n"
+            f"Play wallet:        {play_bal:.2f}\n"
+            f"Deposited total:    {deposited_bal:.2f}\n"
+            f"Total:              {coin_total:.2f}\n"
+            "```",
+            parse_mode="Markdown",
+        )
+
+    elif action == "support":
+        await reply_target.reply_text(
+            f"🆘 Need help? Contact support here: https://t.me/{SUPPORT_USERNAME}"
+        )
+
+    elif action == "instruction":
+        await reply_target.reply_text(INSTRUCTIONS_TEXT)
+
+    elif action == "invite":
+        short_id = user_id[-6:]
+        link = f"https://t.me/Temerachibingo_bot?start=ref{short_id}"
+        await reply_target.reply_text(f"🔗 Invite friends with your link:\n{link}")
+
+    elif action == "deposit":
+        context.user_data["flow"] = "deposit_amount"
+        context.user_data["flow_data"] = {"name": name}
+        await reply_target.reply_text(
+            "💰 ማስገባት የሚፈልጉትን መጠን ከ10 ብር ጀምሮ ያስገቡ።"
+        )
+
+    elif action == "withdraw":
+        wallet = _get_wallet_safe(user_id)
+        main_bal = wallet.get("main", 0)
+        if main_bal <= 0:
+            await reply_target.reply_text(
+                "⚠️ Your main wallet is empty, there's nothing to withdraw.\n\n"
+                f"💰 Main wallet: {main_bal:.2f} ብር"
+            )
+            return
+        context.user_data["flow"] = "withdraw_amount"
+        context.user_data["flow_data"] = {"name": name}
+        await reply_target.reply_text(
+            f"💰 ማውጣት የሚፈልጉትን የገንዘብ መጠን ያስገቡ?\n\n"
+            f"📊 Available: {main_bal:.2f} ብር\n"
+            f"⚠️ Minimum: 20 ብር"
+        )
+
+
+# ============================================================
+# Command Handlers
+# ============================================================
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["flow"] = None
+    caption = "Welcome to Temerachi Bingo! Choose an Option below."
+
+    try:
+        photos = await context.bot.get_user_profile_photos(context.bot.id, limit=1)
+        if photos.total_count > 0:
+            photo_file_id = photos.photos[0][-1].file_id
+            await update.message.reply_photo(
+                photo=photo_file_id,
+                caption=caption,
+                reply_markup=main_menu_keyboard(),
+            )
+            return
+    except Exception as e:
+        log.warning(f"Could not fetch bot profile photo, falling back to text: {e}")
+
+    await update.message.reply_text(caption, reply_markup=main_menu_keyboard())
+
+
+async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await _safe_answer(query)
+    action = query.data.split(":", 1)[1]
+    await _run_menu_action(action, query.message, query.from_user, context)
+
+
+async def deposit_payment_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await _safe_answer(query)
+    choice = query.data.split(":", 1)[1]
+
+    if choice == "cancel":
+        context.user_data["flow"] = None
+        context.user_data["flow_data"] = {}
+        await query.message.reply_text(
+            "Choose an option below:", reply_markup=main_menu_keyboard()
+        )
+        return
+
+    data = context.user_data.setdefault("flow_data", {})
+    amount = data.get("amount")
+    number_obj = get_next_telebirr_number()
+    data["payToPhone"] = number_obj["phone"]
+    data["payToName"] = number_obj["name"]
+    context.user_data["flow"] = "deposit_sms"
+    await query.message.reply_text(
+        f"1. ከታች ባለው የቴሌብር አካውንት {amount} ብር ያስገቡ\n\n"
+        f"Phone:\n`{number_obj['phone']}`\n\n"
+        f"2. የከፈሉበትን አጭር የጹሁፍ መልዕክት(message) copy በማድረግ እዚ ላይ Paste "
+        f"አድርገው ያስገቡና ይላኩት\n👇👇👇",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="deppay:cancel")]]),
+    )
+
+
+async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await _safe_answer(query)
+
+    if query.from_user.id != ADMIN_CHAT_ID:
+        await _safe_answer(query, "❌ You are not authorized.", show_alert=True)
+        return
+
+    parts = query.data.split(":")
+    if len(parts) < 3:
+        await query.edit_message_text("⚠️ Invalid action format.")
+        return
+
+    action, kind, key = parts[0], parts[1], parts[2]
+
+    # ==================== DEPOSIT APPROVAL ====================
+    if kind == "deposit":
+        record = pending_deposits_ref.child(key).get()
+        if not record:
+            await query.edit_message_text("⚠️ Deposit record not found (maybe already handled).")
+            return
+        
+        if record.get("status") != "pending":
+            await query.edit_message_text(f"ℹ️ Already {record.get('status')}.")
+            return
+
+        if action == "approve":
+            amount = record.get("amount", 0)
+            user_id = record.get("by")
+            name = record.get("name", "Player")
+            
+            success, err = _credit_deposit_wallet(user_id, amount)
+            if not success:
+                await query.edit_message_text(f"❌ Failed to credit wallet: {err}")
+                return
+            
+            pending_deposits_ref.child(key).update({
+                "status": "approved",
+                "approved_at": datetime.now().isoformat(),
+                "approved_by": "admin"
+            })
+            
+            deposits_ref.push({
+                "by": user_id,
+                "name": name,
+                "amount": amount,
+                "phone": record.get("phone", ""),
+                "txnId": record.get("txnId", ""),
+                "status": "approved",
+                "autoVerified": False,
+                "adminApproved": True,
+                "timestamp": datetime.now().isoformat(),
+            })
+            
+            await query.edit_message_text(
+                f"✅ Approved deposit of {amount:.2f} ብር for {name}.\n"
+                f"Ref: {record.get('txnId', 'N/A')}"
+            )
+            
+            try:
+                await context.bot.send_message(
+                    chat_id=user_id,
+                    text=f"✅ የ {amount:.2f} ብር ዲፖዚት ጥያቄዎ ጸድቋል!\n"
+                         f"በ Play Wallet ውስጥ ገንዘብዎ ተጨምሯል።\n\n"
+                         f"Ref: {record.get('txnId', 'N/A')}"
+                )
+            except Exception as e:
+                log.warning(f"Could not notify user of deposit approval: {e}")
+                
+        else:
+            pending_deposits_ref.child(key).update({
+                "status": "rejected",
+                "rejected_at": datetime.now().isoformat(),
+                "rejected_by": "admin"
+            })
+            
+            await query.edit_message_text(
+                f"❌ Rejected deposit for {record.get('name', 'User')}.\n"
+                f"Ref: {record.get('txnId', 'N/A')}"
+            )
+            
+            try:
+                await context.bot.send_message(
+                    chat_id=record.get("by"),
+                    text=f"❌ የ {record.get('amount', 0):.2f} ብር ዲፖዚት ጥያቄዎ ተሰርዟል።\n"
+                         f"እባክዎ ደረሰኝዎን አረጋግጠው እንደገና ይሞክሩ።\n\n"
+                         f"Ref: {record.get('txnId', 'N/A')}"
+                )
+            except Exception as e:
+                log.warning(f"Could not notify user of deposit rejection: {e}")
+
+    # ==================== WITHDRAWAL APPROVAL ====================
+    elif kind == "withdrawal":
+        record = withdrawals_ref.child(key).get()
+        if not record:
+            await query.edit_message_text("⚠️ Record not found (maybe already handled).")
+            return
+        if record.get("status") != "pending":
+            await query.edit_message_text(f"ℹ️ Already {record.get('status')}.")
+            return
+
+        if action == "approve":
+            withdrawals_ref.child(key).update({
+                "status": "approved",
+                "approved_at": datetime.now().isoformat(),
+                "approved_by": "admin"
+            })
+            
+            await query.edit_message_text(
+                f"✅ Approved withdrawal of {record.get('amount', 0):.2f} ብር for {record.get('name')}.\n"
+                f"📞 Send to: {record.get('phone')}\n"
+                f"⚠️ Remember to actually SEND the money via Telebirr!"
+            )
+            
+            try:
+                await context.bot.send_message(
+                    chat_id=record["by"],
+                    text=f"✅ የ {record.get('amount', 0):.2f} ብር ማውጫ ጥያቄዎ ጸድቋል!\n"
+                         f"📞 ገንዘቡ ወደ {record.get('phone')} በቴሌብር ይላካል።\n\n"
+                         f"📋 Ref: {key}"
+                )
+            except Exception as e:
+                log.warning(f"Could not notify user of withdrawal approval: {e}")
+                
+        else:
+            user_id = str(record["by"])
+            amount = record.get("amount", 0)
+            name = record.get("name", "User")
+            
+            success, err = _refund_withdrawal(user_id, amount)
+            
+            withdrawals_ref.child(key).update({
+                "status": "rejected",
+                "rejected_at": datetime.now().isoformat(),
+                "rejected_by": "admin",
+                "refunded": success
+            })
+            
+            if success:
+                await query.edit_message_text(
+                    f"❌ Rejected withdrawal for {name}.\n"
+                    f"💰 {amount:.2f} ብር refunded to Main Wallet."
+                )
+            else:
+                await query.edit_message_text(
+                    f"❌ Rejected withdrawal for {name}.\n"
+                    f"⚠️ BUT refund FAILED: {err}\n"
+                    f"Please check manually!"
+                )
+            
+            try:
+                refund_msg = "✅ ገንዘብዎ ወደ Main Wallet ተመልሷል።" if success else "⚠️ እባክዎ ድጋፍ ያግኙ።"
+                await context.bot.send_message(
+                    chat_id=record["by"],
+                    text=f"❌ የ {amount:.2f} ብር ማውጫ ጥያቄዎ ተሰርዟል።\n"
+                         f"{refund_msg}\n\n"
+                         f"📋 Ref: {key}"
+                )
+            except Exception as e:
+                log.warning(f"Could not notify user of withdrawal rejection: {e}")
+
+
+# ============================================================
+# Message Handlers
+# ============================================================
+async def contact_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    contact = update.message.contact
+    user = update.effective_user
+
+    if contact.user_id and contact.user_id != user.id:
+        await update.message.reply_text(
+            "⚠️ የራስዎን ስልክ ቁጥር ብቻ ማጋራት ይችላሉ።",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return
+
+    user_id = str(user.id)
+    name = (user.first_name or "") + (" " + user.last_name if user.last_name else "")
+    name = name.strip() or "Player"
+
+    db.reference(f"users/{user_id}").update({
+        "name": name,
+        "phone": contact.phone_number,
+        "registered": True,
+    })
+    await update.message.reply_text(
+        f"✅ Registered! Welcome, {name}.",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    await update.message.reply_text(
+        "Choose an option below:",
+        reply_markup=main_menu_keyboard(),
+    )
+
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    flow = context.user_data.get("flow")
+    if not flow:
+        return
+
+    user = update.effective_user
+    user_id = str(user.id)
+    text = (update.message.text or "").strip()
+    data = context.user_data.setdefault("flow_data", {})
+
+    # ==================== DEPOSIT FLOW ====================
+    if flow == "deposit_amount":
+        if not text.isdigit() or int(text) < 10:
+            await update.message.reply_text(
+                "💰 ማስገባት የሚፈልጉትን መጠን ከ10 ብር ጀምሮ ያስገቡ።"
+            )
+            return
+        data["amount"] = int(text)
+        context.user_data["flow"] = None
+        await update.message.reply_text(
+            "❇️ ማስገባት የሚችሉት አሁን በተቀመጠዉ የTelebirr አካዉንት ብቻ ነዉ።\n\n"
+            "🚫 ከዚህ ዉጭ የላከ አናስተናግድም 🚫\n\n"
+            "👇 Telebirr የሚለዉን ይምረጡ👇",
+            reply_markup=deposit_payment_keyboard(),
+        )
+
+    elif flow == "deposit_sms":
+        if _deposit_rate_limited(user_id):
+            await update.message.reply_text(
+                "🚫 በአጭር ጊዜ ውስጥ በጣም ብዙ ጥያቄ ልከዋል። እባክዎ ትንሽ ቆይተው ደግመው ይሞክሩ ወይም "
+                f"@{SUPPORT_USERNAME} ላይ ይፃፉልን።"
+            )
+            return
+
+        parsed = parse_telebirr_sms_improved(text)
+        
+        if not parsed:
+            await update.message.reply_text(
+                "🚫 ኤስኤምኤሱ ሊነበብ አልቻለም። እባክዎ ስልክዎ ላይ የገባውን ትክክለኛ ሚሴጅ (SMS) ሙሉ በሙሉ ኮፒ አድርገው ይላኩ፡፡\n\n"
+                f"❓ለድጋፍ @{SUPPORT_USERNAME} ላይ ይፃፉልን"
+            )
+            return
+
+        receipt_no = parsed.get("txn_id") or parsed.get("receipt_id")
+        
+        if not receipt_no:
+            await update.message.reply_text(
+                "🚫 የግብይት መለያ (Transaction ID) በኤስኤምኤስ ውስጥ አልተገኘም።\n\n"
+                "ሙሉውን ኤስኤምኤስ ኮፒ አድርገው ይላኩ።\n\n"
+                f"❓ለድጋፍ @{SUPPORT_USERNAME} ላይ ይፃፉልን"
+            )
+            return
+
+        if used_deposit_ids_ref.child(receipt_no).get():
+            await update.message.reply_text(
+                "🚫 ይህ የደረሰኝ ቁጥር (transaction ID) ቀድሞ ጥቅም ላይ ውሏል።\n\n"
+                f"❓ለድጋፍ @{SUPPORT_USERNAME} ላይ ይፃፉልን"
+            )
+            return
+
+        stated_amount = data.get("amount")
+        data["smsText"] = text
+        data["txnId"] = receipt_no
+
+        await update.message.reply_text(
+            "🔎 ደረሰኝዎን በማረጋገጥ ላይ ነው...\n"
+            "⏳ እባክዎ ይጠብቁ (እስከ 2 ደቂቃ ሊፈጅ ይችላል)\n"
+            f"📋 የደረሰኝ ቁጥር: {receipt_no}"
+        )
+
+        loop = asyncio.get_running_loop()
+        receipt = await loop.run_in_executor(
+            None, fetch_telebirr_receipt_with_retry_improved, receipt_no, 120, 5
+        )
+
+        verified = False
+        verified_amount = None
+        
+        if receipt and receipt.get("amount"):
+            receipt_amount = receipt["amount"]
+            
+            amount_ok = stated_amount is not None and abs(receipt_amount - float(stated_amount)) <= 0.01
+            
+            our_last4s = {n["phone"][-4:] for n in TELEBIRR_NUMBERS}
+            found_phones = receipt.get("all_phones", [])
+            phone_ok = any(p[-4:] in our_last4s for p in found_phones)
+            
+            freshness_ok = True
+            if receipt.get("date_text"):
+                parsed_dt = None
+                for fmt in ("%d/%m/%Y, %H:%M:%S", "%d/%m/%Y %H:%M:%S", "%d-%m-%Y %H:%M:%S", "%d/%m/%Y, %H:%M", "%d/%m/%Y %H:%M"):
+                    try:
+                        parsed_dt = datetime.strptime(receipt["date_text"].strip(), fmt)
+                        break
+                    except ValueError:
+                        continue
+                if parsed_dt:
+                    age_seconds = (datetime.now() - parsed_dt).total_seconds()
+                    freshness_ok = -300 <= age_seconds <= 7200
+            
+            ceiling_ok = receipt_amount <= AUTO_APPROVE_MAX_AMOUNT
+            
+            verified = amount_ok and phone_ok and freshness_ok and ceiling_ok
+            verified_amount = receipt_amount
+
+        context.user_data["flow"] = None
+        context.user_data["flow_data"] = {}
+
+        if verified:
+            already_used_holder = {"already_used": False}
+
+            def reserve_after_verify(current):
+                if current:
+                    already_used_holder["already_used"] = True
+                    return current
+                return True
+
+            used_deposit_ids_ref.child(receipt_no).transaction(reserve_after_verify)
+
+            if already_used_holder["already_used"]:
+                await update.message.reply_text(
+                    "🚫 ይህ የደረሰኝ ቁጥር ቀድሞ ጥቅም ላይ ውሏል።\n\n"
+                    f"❓ለድጋፍ @{SUPPORT_USERNAME} ላይ ይፃፉልን"
+                )
+                return
+
+            success, err = _credit_deposit_wallet(user_id, verified_amount)
+            if success:
+                deposits_ref.push({
+                    "by": user_id,
+                    "name": data.get("name", "Player"),
+                    "amount": verified_amount,
+                    "phone": data.get("payToPhone", ""),
+                    "smsText": text,
+                    "paidTo": data.get("payToPhone", ""),
+                    "txnId": receipt_no,
+                    "status": "approved",
+                    "autoVerified": True,
+                    "timestamp": datetime.now().isoformat(),
+                })
+                await update.message.reply_text(
+                    f"✅ የ {verified_amount:.2f} ብር ዲፖዚት ጸድቋል!\n"
+                    f"📋 የደረሰኝ ቁጥር: {receipt_no}\n\n"
+                    "💰 ገንዘብዎ በPlay Wallet ውስጥ ተጨምሯል።"
+                )
+                try:
+                    await context.bot.send_message(
+                        chat_id=ADMIN_CHAT_ID,
+                        text=f"✅ Auto-approved deposit: {data.get('name', 'Player')} +{verified_amount:.2f} ብር (Ref {receipt_no})",
+                    )
+                except Exception as e:
+                    log.warning(f"Could not send admin notification: {e}")
+                return
+
+        pending_key = pending_deposits_ref.push({
+            "by": user_id,
+            "name": data.get("name", "Player"),
+            "amount": stated_amount,
+            "phone": data.get("payToPhone", ""),
+            "smsText": text,
+            "paidTo": data.get("payToPhone", ""),
+            "txnId": receipt_no,
+            "status": "pending",
+            "timestamp": datetime.now().isoformat(),
+            "auto_verify_failed": True,
+            "parsed_data": parsed,
+        }).key
+
+        try:
+            keyboard = admin_deposit_keyboard(pending_key)
+            await context.bot.send_message(
+                chat_id=ADMIN_CHAT_ID,
+                text=(
+                    f"🪙 New Deposit Request (Auto-Verify Failed)\n"
+                    f"Name: {data.get('name', 'Player')}\n"
+                    f"Amount: {stated_amount} ብር\n"
+                    f"Txn ID: {receipt_no}\n"
+                    f"Phone: {data.get('payToPhone', '')}\n\n"
+                    f"📝 SMS:\n{text[:500]}"
+                ),
+                reply_markup=keyboard,
+            )
+        except Exception as e:
+            log.warning(f"Could not notify admin: {e}")
+
+        await update.message.reply_text(
+            f"⏳ የዲፖዚት ጥያቄዎ ለአስተዳዳሪ ተልኳል።\n"
+            f"📋 የደረሰኝ ቁጥር: {receipt_no}\n\n"
+            f"እባክዎ ትንሽ ይጠብቁ፣ አስተዳዳሪው ያረጋግጥልዎታል።\n"
+            f"ጥያቄ ካለዎት @{SUPPORT_USERNAME} ላይ ይፃፉልን።"
+        )
+
+    # ==================== WITHDRAW FLOW ====================
+    elif flow == "withdraw_amount":
+        wallet = _get_wallet_safe(user_id)
+        main_bal = wallet.get("main", 0)
+        
+        if not text.isdigit():
+            await update.message.reply_text(
+                "⚠️ እባክዎ ትክክለኛ ቁጥር ያስገቡ።\n\n"
+                f"📊 Available: {main_bal:.2f} ብር"
+            )
+            return
+        
+        amount = int(text)
+        if amount < 20:
+            await update.message.reply_text(
+                f"⚠️ ዝቅተኛው መጠን 20 ብር ነው።\n\n"
+                f"📊 Available: {main_bal:.2f} ብር"
+            )
+            return
+        
+        if amount > main_bal:
+            await update.message.reply_text(
+                f"⚠️ በቂ ገንዘብ የለህም!\n\n"
+                f"📊 Available: {main_bal:.2f} ብር\n"
+                f"💰 Requested: {amount} ብር"
+            )
+            return
+        
+        data["amount"] = amount
+        context.user_data["flow"] = "withdraw_phone"
+        await update.message.reply_text(
+            f"✅ Amount {amount} ብር accepted.\n\n"
+            f"📞 ገንዘቡ ወደ የትኛው የቴሌብር ቁጥር ይላክ?\n"
+            f"ለምሳሌ: 0911223344"
+        )
+
+    elif flow == "withdraw_phone":
+        user_id_str = user_id
+        amount = data.get("amount", 0)
+        phone = text.strip()
+        
+        if not phone or len(phone) < 8:
+            await update.message.reply_text(
+                "⚠️ እባክዎ ትክክለኛ የቴሌብር ቁጥር ያስገቡ።\n"
+                "ለምሳሌ: 0911223344"
+            )
+            return
+        
+        db.reference(f"users/{user_id_str}").update({"phone": phone})
+        
+        success, err = _debit_withdrawal(user_id_str, amount)
+        
+        if not success:
+            await update.message.reply_text(
+                f"❌ ማውጫ ጥያቄ ሳይሳካ ቀረ: {err}\n\n"
+                f"እባክዎ እንደገና ይሞክሩ ወይም @{SUPPORT_USERNAME} ያግኙ።"
+            )
+            context.user_data["flow"] = None
+            context.user_data["flow_data"] = {}
+            return
+        
+        key = withdrawals_ref.push({
+            "by": user_id_str,
+            "name": data.get("name", "Player"),
+            "amount": amount,
+            "phone": phone,
+            "status": "pending",
+            "timestamp": datetime.now().isoformat(),
+        }).key
+        
+        context.user_data["flow"] = None
+        context.user_data["flow_data"] = {}
+        
+        await update.message.reply_text(
+            f"⏳ ማውጫ ጥያቄ ተልኳል!\n\n"
+            f"💰 Amount: {amount:.2f} ብር\n"
+            f"📞 Phone: {phone}\n"
+            f"📋 Request ID: {key[:8]}\n\n"
+            f"እባክዎ አስተዳዳሪው እስኪያረጋግጥ ይጠብቁ።"
+        )
+        
+        try:
+            keyboard = InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ Approve", callback_data=f"approve:withdrawal:{key}"),
+                InlineKeyboardButton("❌ Reject", callback_data=f"reject:withdrawal:{key}"),
+            ]])
+            await context.bot.send_message(
+                chat_id=ADMIN_CHAT_ID,
+                text=(
+                    f"💸 New Withdrawal Request\n"
+                    f"Name: {data.get('name', 'Player')}\n"
+                    f"Amount: {amount:.2f} ብር\n"
+                    f"Phone: {phone}\n"
+                    f"Request ID: {key}"
+                ),
+                reply_markup=keyboard,
+            )
+        except Exception as e:
+            log.warning(f"Could not notify admin of withdrawal: {e}")
+
+
+# ============================================================
+# Slash Commands
+# ============================================================
+async def register_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _run_menu_action("register", update.message, update.effective_user, context)
+
+
+async def balance_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _run_menu_action("balance", update.message, update.effective_user, context)
+
+
+async def deposit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _run_menu_action("deposit", update.message, update.effective_user, context)
+
+
+async def play_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _run_menu_action("play", update.message, update.effective_user, context)
+
+
+async def instruction_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _run_menu_action("instruction", update.message, update.effective_user, context)
+
+
+async def contactsupport_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _run_menu_action("support", update.message, update.effective_user, context)
+
+
+async def invite_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _run_menu_action("invite", update.message, update.effective_user, context)
+
+
+async def withdraw_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _run_menu_action("withdraw", update.message, update.effective_user, context)
+
+
+# ============================================================
+# Error Handler
+# ============================================================
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    log.error("Unhandled exception while processing an update", exc_info=context.error)
+
+
+# ============================================================
+# Main Application
+# ============================================================
+main_loop = None
+
+
+async def on_startup(application):
+    global main_loop
+    main_loop = asyncio.get_running_loop()
+    log.info("Event loop captured; admin notifications are now live.")
+
+
+def main():
+    global app
+    app = Application.builder().token(BOT_TOKEN).post_init(on_startup).build()
+    app.add_error_handler(error_handler)
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("register", register_command))
+    app.add_handler(CommandHandler("balance", balance_command))
+    app.add_handler(CommandHandler("deposit", deposit_command))
+    app.add_handler(CommandHandler("withdraw", withdraw_command))
+    app.add_handler(CommandHandler("play", play_command))
+    app.add_handler(CommandHandler("instruction", instruction_command))
+    app.add_handler(CommandHandler("contactsupport", contactsupport_command))
+    app.add_handler(CommandHandler("invite", invite_command))
+
+    app.add_handler(CallbackQueryHandler(menu_handler, pattern=r"^menu:"))
+    app.add_handler(CallbackQueryHandler(deposit_payment_handler, pattern=r"^deppay:"))
+    app.add_handler(CallbackQueryHandler(handle_button, pattern=r"^(approve|reject):"))
+
+    app.add_handler(MessageHandler(filters.CONTACT, contact_handler))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+
+    threading.Thread(target=run_web_server, daemon=True).start()
+
+    log.info("Bot starting with improved wallet & withdraw system...")
+    app.run_polling()
+
+
+if __name__ == "__main__":
+    main()
