@@ -107,9 +107,9 @@ _deposit_attempt_lock = threading.Lock()
 DEPOSIT_RATE_LIMIT_MAX = 5       # attempts
 DEPOSIT_RATE_LIMIT_WINDOW = 600  # seconds (10 minutes)
 # Fraud-hardening: even a fully verified deposit above this amount is routed
-# to support instead of being auto-credited -- an extra layer of caution for
-# unusually large sums, in case the verification logic itself is ever wrong
-# or the page format changes in a way we haven't caught. Adjust as needed.
+# to admin review instead of being auto-credited -- an extra layer of caution
+# for unusually large sums, in case the verification logic itself is ever
+# wrong or the page format changes in a way we haven't caught.
 AUTO_APPROVE_MAX_AMOUNT = 2000
 
 
@@ -155,32 +155,37 @@ def get_next_telebirr_number():
 # Returns a dict with amount / phone_last4 / txn_id, or None if the text
 # doesn't look like a real Telebirr SMS at all.
 def parse_telebirr_sms(text):
-    # Amount: collect EVERY "X ብር" figure in the message (not just the first).
-    # Real Telebirr SMS can mention more than one monetary amount (e.g. a
-    # service fee alongside the actual transferred amount) -- returning every
-    # candidate lets the caller pick the one that actually matches what the
-    # user said they sent, instead of blindly trusting whichever number
-    # happens to appear first.
-    amount_matches = re.findall(r"([\d,]+(?:\.\d+)?)\s*ብር", text)
+    # Amount: collect EVERY monetary figure in the message (not just the
+    # first), regardless of whether the SMS wording is Amharic ("ብር") or
+    # English ("Birr"/"ETB") -- Telebirr sends in whichever language the
+    # recipient's SIM/handset is set to, and earlier only matching "ብር"
+    # silently broke everything for English-language messages.
+    amount_matches = re.findall(r"([\d,]+(?:\.\d+)?)\s*(?:ብር|Birr|ETB)", text, re.IGNORECASE)
     # Phone (last 4 digits of the masked sender number): informational only,
     # not required for the deposit to be considered valid -- we already
     # verify the depositing user via their Telegram account, so a missing or
     # differently-formatted phone snippet should not block an otherwise valid
     # deposit.
     phone_match = re.search(r"\(?251\d\*+(\d{2,4})\)?", text)
-    # Transaction ID: accept both common Amharic spellings/diacritics of
-    # "ነው" ("ነዉ"/"ነው") since real messages aren't guaranteed to use the one
-    # exact variant we happened to hardcode, and allow slightly looser
-    # spacing around "ቁጥርዎ".
-    txn_match = re.search(r"ቁጥርዎ\s*(\S+)\s*ነ[ዉው]", text)
-    if not txn_match:
-        # Fallback: some message variants phrase it differently -- try to
-        # grab any long alphanumeric token that looks like a transaction
-        # reference (Telebirr references are typically 8-12 uppercase
-        # letters/digits).
-        txn_match = re.search(r"\b([A-Z0-9]{8,14})\b", text)
+    # Transaction ID: try Amharic phrasing first (accepting both common
+    # spellings/diacritics of "ነው"/"ነዉ"), then common English phrasings, then
+    # fall back to any bare alphanumeric reference code -- that last fallback
+    # alone is language-independent, so it still catches the ID even for SMS
+    # wordings we haven't specifically seen yet.
+    txn_match = (
+        re.search(r"ቁጥርዎ\s*(\S+)\s*ነ[ዉው]", text)
+        or re.search(
+            r"(?:transaction\s*(?:number|id)|txn\s*id|ref(?:erence)?\s*(?:no\.?|number)?)\s*(?:is|:)?\s*([A-Za-z0-9]{6,20})",
+            text, re.IGNORECASE,
+        )
+        or re.search(r"\b([A-Z0-9]{8,14})\b", text)
+    )
 
-    if not (amount_matches and txn_match):
+    # NOTE: amounts and txn_id are independent -- a message can have a valid
+    # txn ID even if the amount wording doesn't match anything we recognize
+    # (or vice versa). Only the txn ID is actually required by callers today,
+    # so we must not let a missing amount silently erase a found txn ID.
+    if not txn_match:
         return None
 
     amounts = []
@@ -189,8 +194,6 @@ def parse_telebirr_sms(text):
             amounts.append(float(raw.replace(",", "")))
         except ValueError:
             continue
-    if not amounts:
-        return None
 
     return {
         "amounts": amounts,
@@ -208,13 +211,12 @@ def fetch_telebirr_receipt(receipt_no):
     Ethio Telecom's own servers from the real transaction record, so a match
     here is much stronger proof the deposit is genuine.
 
-    IMPORTANT CAVEAT: the exact HTML structure of this page has not been
-    verified against a live fetch (automated access to it is blocked for
-    testing purposes), so this parser uses flexible, best-effort patterns
-    rather than one confirmed exact layout. Returns None on ANY failure
-    (network error, unexpected page structure, etc.) -- callers must treat
-    None as "could not auto-verify" and fall back to manual admin review,
-    never as a rejection.
+    ALWAYS returns a "debug" field describing exactly what happened (the
+    network error, the HTTP status, or a snippet of the raw HTML if the
+    amount couldn't be found) -- so any failure can be diagnosed from real
+    evidence (sent to the admin) instead of guessed at. Never raises; the
+    caller must treat ok=False as "could not auto-verify" and fall back to
+    manual admin review, never as a rejection.
     """
     url = f"https://transactioninfo.ethiotelecom.et/receipt/{receipt_no}"
     req = urllib.request.Request(
@@ -228,36 +230,37 @@ def fetch_telebirr_receipt(receipt_no):
     )
     try:
         with urllib.request.urlopen(req, timeout=15) as resp:
+            status = resp.status
             html = resp.read().decode("utf-8", errors="ignore")
-    except (urllib.error.URLError, TimeoutError, Exception) as e:
+    except Exception as e:
         log.warning(f"Receipt fetch failed for {receipt_no}: {e}")
-        return None
+        return {"ok": False, "debug": f"fetch error: {e!r}"}
 
     amount_match = re.search(r"([\d,]+(?:\.\d+)?)\s*(?:ETB|Birr|ብር)", html, re.IGNORECASE)
     if not amount_match:
-        log.warning(f"Receipt page for {receipt_no} fetched but amount not found -- page structure may differ from expected")
-        return None
+        snippet = re.sub(r"\s+", " ", html).strip()[:1500]
+        log.warning(f"Receipt page for {receipt_no} fetched (HTTP {status}) but amount not found")
+        return {"ok": False, "debug": f"HTTP {status}, amount not found. Page snippet: {snippet}"}
     try:
         amount = float(amount_match.group(1).replace(",", ""))
     except ValueError:
-        return None
+        return {"ok": False, "debug": f"HTTP {status}, amount text unparseable: {amount_match.group(1)!r}"}
 
     # Every phone-like number on the page (there may be more than one --
     # sender and recipient both appear). The caller cross-checks these
-    # against our own business numbers; if we can't find ANY, the caller
-    # must NOT assume the recipient is us -- see the fraud-prevention note
-    # at the call site.
+    # against our own business numbers.
     all_phones = re.findall(r"(?:251)?0?9\d{8}", html)
 
     # Transaction date/time, if present on the page, so the caller can
-    # reject a receipt that isn't actually recent (prevents someone reusing
-    # an old or leaked receipt number well after the fact).
+    # reject a receipt that isn't actually recent.
     date_match = re.search(r"(\d{1,2}[/-]\d{1,2}[/-]\d{4}[,\s]+\d{1,2}:\d{2}(?::\d{2})?)", html)
 
     return {
+        "ok": True,
         "amount": amount,
         "all_phones": all_phones,
         "date_text": date_match.group(1) if date_match else None,
+        "debug": None,
     }
 
 
@@ -266,9 +269,9 @@ def fetch_telebirr_receipt_with_retry(receipt_no, max_wait_seconds=90, poll_inte
     Keep polling Ethio Telecom's receipt page for up to max_wait_seconds,
     since the page is sometimes slow to publish a brand-new transaction (or
     slow to respond at all). Stops as soon as a receipt is found, or gives
-    up (returns None) once the time budget runs out -- callers must still
-    treat None as "could not auto-verify", never as "invalid", since a
-    non-existent/mistyped receipt number will also end up here.
+    up once the time budget runs out -- returns the LAST attempt's result
+    dict either way (never None), so the caller always has debug info to
+    show the admin.
 
     This function does blocking network calls and time.sleep(), so callers
     on the bot's event loop MUST run it via loop.run_in_executor(...) rather
@@ -276,14 +279,15 @@ def fetch_telebirr_receipt_with_retry(receipt_no, max_wait_seconds=90, poll_inte
     """
     deadline = time.time() + max_wait_seconds
     attempt = 0
+    last_result = {"ok": False, "debug": "no attempts made"}
     while True:
         attempt += 1
-        receipt = fetch_telebirr_receipt(receipt_no)
-        if receipt is not None:
-            return receipt
+        last_result = fetch_telebirr_receipt(receipt_no)
+        if last_result.get("ok"):
+            return last_result
         if time.time() >= deadline:
             log.info(f"Giving up on receipt {receipt_no} after {attempt} attempts (~{max_wait_seconds}s budget)")
-            return None
+            return last_result
         time.sleep(poll_interval)
 
 
@@ -604,8 +608,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parsed = parse_telebirr_sms(text)
 
         # Extract a receipt/transaction reference number -- either from a
-        # pasted https://transactioninfo.ethiotelecom.et/receipt/XXXX link,
-        # or from the SMS text itself (reusing the existing txn_id patterns).
+        # pasted https://transactioninfo.ethiotelecom.et/receipt/XXXX link
+        # (language-independent, since it's a literal URL), or from the SMS
+        # text itself via parse_telebirr_sms (now handles both Amharic and
+        # English wording).
         receipt_url_match = re.search(
             r"transactioninfo\.ethiotelecom\.et/receipt/([A-Za-z0-9]+)", text
         )
@@ -615,7 +621,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Defense in depth: whatever the source, only accept a strictly
         # alphanumeric reference of a sane length before we ever use it to
-        # build a URL or as a Firebase key.
+        # build a Firebase key.
         if receipt_no and not re.fullmatch(r"[A-Za-z0-9]{6,20}", receipt_no):
             receipt_no = None
 
@@ -627,14 +633,21 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        # IMPORTANT: Do NOT reserve the receipt before remote verification.
-        # A timeout / temporary Ethio Telecom error must not permanently lock
-        # a legitimate receipt. The receipt is reserved atomically only AFTER
-        # all verification checks pass, immediately before wallet credit.
+        # Atomically reserve the receipt/txn ID now, so the same SMS can't
+        # be submitted twice while it's awaiting admin review. If the admin
+        # rejects it, the reservation is released so the user can resubmit
+        # (e.g. after correcting a typo).
+        already_used_holder = {"already_used": False}
 
-        # Fast duplicate check. This is only an early rejection for receipts
-        # that were already successfully reserved/processed in the past.
-        if used_deposit_ids_ref.child(receipt_no).get():
+        def reserve(current):
+            if current:
+                already_used_holder["already_used"] = True
+                return current
+            return True
+
+        used_deposit_ids_ref.child(receipt_no).transaction(reserve)
+
+        if already_used_holder["already_used"]:
             log.info(f"Deposit duplicate for user {user_id}: receipt/txn_id={receipt_no} already reserved")
             await update.message.reply_text(
                 "🚫 ይህ የደረሰኝ ቁጥር (transaction ID) ቀድሞ ጥቅም ላይ ውሏል። እያንዳንዱ ደረሰኝ አንድ ጊዜ ብቻ ጥቅም ላይ ሊውል ይችላል፡፡\n\n"
@@ -643,7 +656,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         stated_amount = data.get("amount")
-        data["smsText"] = text
+        context.user_data["flow"] = None
+        context.user_data["flow_data"] = {}
 
         # Let the user know we're checking -- the retrying verification
         # below can take up to a minute, and without this the chat would
@@ -651,107 +665,64 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("🔎 ደረሰኝዎን በማረጋገጥ ላይ ነው... እባክዎ ይጠብቁ (እስከ 1 ደቂቃ ሊፈጅ ይችላል)")
 
         # --- Automatic verification against Ethio Telecom's own official
-        # receipt page. This is the PRIMARY path now -- if it succeeds and
-        # matches, the deposit is credited immediately with no admin step.
-        # Retries for up to a minute (the page is sometimes slow to publish
-        # a brand-new transaction), run via run_in_executor so this blocking
-        # network polling never freezes the bot for OTHER users in the
-        # meantime.
+        # receipt page. If it succeeds and matches, the deposit is credited
+        # immediately with no admin step. Runs via run_in_executor so this
+        # blocking network polling never freezes the bot for other users.
         loop = asyncio.get_running_loop()
-        receipt = await loop.run_in_executor(
+        result = await loop.run_in_executor(
             None, fetch_telebirr_receipt_with_retry, receipt_no
         )
         verified = False
         verified_amount = None
-        if receipt:
-            amount_ok = stated_amount is not None and abs(receipt["amount"] - float(stated_amount)) <= 0.01
+        if result.get("ok"):
+            amount_ok = stated_amount is not None and abs(result["amount"] - float(stated_amount)) <= 0.01
 
-            # Fraud prevention: the recipient MUST be verified as one of our
-            # own business numbers. If we can't find any phone number on the
-            # page at all, that is NOT treated as "assume it's fine" -- a
-            # real Telebirr receipt paid to someone else entirely would
-            # otherwise slip through auto-approval as long as the amount
-            # happened to match. An unverifiable recipient always falls back
-            # to manual admin review instead of auto-crediting.
+            # Fraud prevention: the recipient MUST be one of our own business
+            # numbers, and an unverifiable recipient (no phone found at all)
+            # never auto-approves -- falls back to manual review instead.
             our_last4s = {n["phone"][-4:] for n in TELEBIRR_NUMBERS}
-            found_phones = receipt.get("all_phones") or []
+            found_phones = result.get("all_phones") or []
             phone_ok = any(p[-4:] in our_last4s for p in found_phones)
 
-            # Fraud prevention: the transaction must be recent. If the page
-            # gives us a date/time, reject anything older than 60 minutes --
-            # this stops someone reusing an old or leaked receipt number.
-            # If we can't parse a date at all, we don't block on it (this is
-            # a bonus defense-in-depth check, not the primary gate).
+            # Fraud prevention: reject anything older than 60 minutes if a
+            # date is present (stops reuse of an old/leaked receipt number).
             freshness_ok = True
-            if receipt.get("date_text"):
+            if result.get("date_text"):
                 parsed_dt = None
                 for fmt in ("%d/%m/%Y, %H:%M:%S", "%d/%m/%Y %H:%M:%S", "%d-%m-%Y %H:%M:%S", "%d/%m/%Y, %H:%M", "%d/%m/%Y %H:%M"):
                     try:
-                        parsed_dt = datetime.strptime(receipt["date_text"].strip(), fmt)
+                        parsed_dt = datetime.strptime(result["date_text"].strip(), fmt)
                         break
                     except ValueError:
                         continue
                 if parsed_dt:
                     age_seconds = (datetime.now() - parsed_dt).total_seconds()
-                    freshness_ok = -300 <= age_seconds <= 3600  # allow a little clock skew, cap at 1 hour old
+                    freshness_ok = -300 <= age_seconds <= 3600
 
-            # Fraud-hardening: even if everything else checks out, cap how
-            # large an auto-approved deposit can be -- large sums get routed
-            # to support instead, as an extra layer of caution.
-            ceiling_ok = receipt["amount"] <= AUTO_APPROVE_MAX_AMOUNT
+            ceiling_ok = result["amount"] <= AUTO_APPROVE_MAX_AMOUNT
 
             verified = amount_ok and phone_ok and freshness_ok and ceiling_ok
-            verified_amount = receipt["amount"]
+            verified_amount = result["amount"]
             if not verified:
-                log.info(
-                    f"Auto-verify failed for {receipt_no}: amount_ok={amount_ok} "
-                    f"phone_ok={phone_ok} freshness_ok={freshness_ok} ceiling_ok={ceiling_ok} "
-                    f"receipt={receipt} stated={stated_amount}"
+                result["debug"] = (
+                    f"amount_ok={amount_ok} phone_ok={phone_ok} freshness_ok={freshness_ok} "
+                    f"ceiling_ok={ceiling_ok} stated={stated_amount} raw={result}"
                 )
-        else:
-            log.info(f"Auto-verify: could not fetch/parse receipt page for {receipt_no}")
-
-        context.user_data["flow"] = None
-        context.user_data["flow_data"] = {}
 
         if verified:
-            # Atomically reserve only AFTER successful remote verification.
-            # This prevents a timeout/temporary fetch failure from consuming
-            # the receipt ID while still preventing double-credit races.
-            already_used_holder = {"already_used": False}
-
-            def reserve_after_verify(current):
-                if current:
-                    already_used_holder["already_used"] = True
-                    return current
-                return True
-
-            used_deposit_ids_ref.child(receipt_no).transaction(reserve_after_verify)
-
-            if already_used_holder["already_used"]:
-                log.info(f"Deposit duplicate race for user {user_id}: receipt/txn_id={receipt_no} already reserved")
-                await update.message.reply_text(
-                    "🚫 ይህ የደረሰኝ ቁጥር (transaction ID) ቀድሞ ጥቅም ላይ ውሏል። ይህ ደረሰኝ አስቀድሞ ተረጋግጦ ተጠቅሟል።\n\n"
-                    f"❓ለድጋፍ @{SUPPORT_USERNAME} ላይ ይፃፉልን"
-                )
-                return
-
             success, err = _credit_deposit_wallet(user_id, verified_amount)
             if success:
-                key = deposits_ref.push({
+                deposits_ref.push({
                     "by": user_id,
                     "name": data.get("name", "Player"),
                     "amount": verified_amount,
-                    "phone": data.get("payToPhone", ""),
                     "smsText": text,
-                    "paidTo": data.get("payToPhone", ""),
                     "txnId": receipt_no,
                     "status": "approved",
                     "autoVerified": True,
-                }).key
+                })
                 await update.message.reply_text(
-                    f"✅ Your deposit of {verified_amount} ETB is Approved.\n"
-                    f"Ref: {receipt_no}"
+                    f"✅ Your deposit of {verified_amount} ETB is Approved.\nRef: {receipt_no}"
                 )
                 try:
                     await context.bot.send_message(
@@ -761,37 +732,33 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except Exception as e:
                     log.warning(f"Could not send admin FYI for auto-approved deposit: {e}")
                 return
-            # Wallet credit failed even though verification succeeded --
-            # the receipt_no stays reserved (correctly preventing reuse) and
-            # we fall through to the failed-verification message below so the
-            # user is directed to support instead of the money being lost.
+            # Verified but the wallet credit itself failed -- fall through to
+            # the pending/admin path below instead of losing the deposit.
+            result["debug"] = f"verified but wallet credit failed: {err}"
             log.warning(f"Auto-verified but wallet credit failed for {receipt_no}: {err}")
 
-        # --- Could not auto-verify (or credit failed). There is no manual
-        # admin-approval step anymore, so we must NOT tell the user "waiting
-        # for admin" -- that would never resolve. Store the attempt for
-        # support's reference and direct the user there directly.
-        fallback_amount = stated_amount
-        if parsed:
-            for candidate in parsed["amounts"]:
-                if stated_amount is not None and abs(candidate - float(stated_amount)) <= 0.01:
-                    fallback_amount = candidate
-                    break
-
+        # --- Could not auto-verify (or credit failed) -- hybrid fallback:
+        # hand off to the admin for manual approve/reject instead of
+        # dead-ending the user, and include the real debug evidence so the
+        # auto-verify parser can actually be fixed based on facts.
         key = deposits_ref.push({
             "by": user_id,
             "name": data.get("name", "Player"),
-            "amount": fallback_amount,
-            "phone": data.get("payToPhone", ""),
+            "amount": stated_amount,
             "smsText": text,
-            "paidTo": data.get("payToPhone", ""),
             "txnId": receipt_no,
-            "status": "failed_verification",
+            "status": "pending",
         }).key
         await update.message.reply_text(
-            f"⚠️ ራስ-ሰር ማረጋገጫ አልተሳካም። እባክዎ ደረሰኝ ቁጥርዎን ({receipt_no}) ይዘው "
-            f"@{SUPPORT_USERNAME} ላይ ይፃፉልን፣ በእጅ እናረጋግጥልዎታለን።"
+            "⏳ በራስ-ሰር ማረጋገጥ አልቻልንም። ወደ አድሚን ተልኳል፣ በቅርቡ በእጅ ይረጋገጥልዎታል።"
         )
+        _notify_admin_deposit(key, {
+            "name": data.get("name", "Player"),
+            "amount": stated_amount,
+            "smsText": text,
+            "txnId": receipt_no,
+            "debug": result.get("debug"),
+        })
 
     # ---- Withdraw flow: amount -> phone ----
     elif flow == "withdraw_amount":
@@ -903,6 +870,62 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             wallet_ref.transaction(refund)
             await query.edit_message_text(f"❌ Rejected withdrawal, refunded {amount} coins to {record.get('name')}.")
 
+    elif kind == "deposit":
+        record = deposits_ref.child(key).get()
+        if not record:
+            await query.edit_message_text("⚠️ Record not found (maybe already handled).")
+            return
+        if record.get("status") != "pending":
+            await query.edit_message_text(f"ℹ️ Already {record.get('status')}.")
+            return
+
+        user_id = str(record["by"])
+        amount = record.get("amount")
+        txn_id = record.get("txnId")
+
+        if action == "approve":
+            # Credit the wallet FIRST, only mark "approved" after the credit
+            # actually succeeds -- if it fails, the deposit stays "pending"
+            # (never silently lost) and the admin is told directly so they
+            # can retry the approve.
+            success, err = _credit_deposit_wallet(user_id, amount)
+            if not success:
+                await query.edit_message_text(
+                    f"⚠️ Wallet credit FAILED for {record.get('name')} (+{amount}). "
+                    f"Deposit left pending -- please retry approve. Error: {err}"
+                )
+                return
+            deposits_ref.child(key).update({"status": "approved"})
+            await query.edit_message_text(
+                f"✅ Approved deposit of {amount} coins for {record.get('name')} (Ref {txn_id})."
+            )
+            try:
+                await context.bot.send_message(
+                    chat_id=int(user_id),
+                    text=f"✅ Your deposit of {amount} ETB is Approved.\nRef: {txn_id}",
+                )
+            except Exception as e:
+                log.warning(f"Could not notify user {user_id} of deposit approval: {e}")
+        else:
+            deposits_ref.child(key).update({"status": "rejected"})
+            # Release the reserved receipt/txn ID so the user can resubmit
+            # (e.g. after correcting a typo in the SMS text).
+            if txn_id:
+                used_deposit_ids_ref.child(txn_id).delete()
+            await query.edit_message_text(
+                f"❌ Rejected deposit of {amount} coins for {record.get('name')} (Ref {txn_id})."
+            )
+            try:
+                await context.bot.send_message(
+                    chat_id=int(user_id),
+                    text=(
+                        f"❌ Your deposit submission (Ref {txn_id}) could not be verified. "
+                        f"እባክዎ ትክክለኛውን ደረሰኝ በድጋሚ ይላኩ ወይም @{SUPPORT_USERNAME} ላይ ይፃፉልን።"
+                    ),
+                )
+            except Exception as e:
+                log.warning(f"Could not notify user {user_id} of deposit rejection: {e}")
+
 
 # ---- Firebase realtime listeners: notify admin of new pending requests ----
 def on_withdrawal_change(event):
@@ -928,6 +951,27 @@ def _notify_admin_withdrawal(key, record):
     keyboard = InlineKeyboardMarkup([[
         InlineKeyboardButton("✅ Approve", callback_data=f"approve:withdrawal:{key}"),
         InlineKeyboardButton("❌ Reject", callback_data=f"reject:withdrawal:{key}"),
+    ]])
+    _send_to_admin(text, keyboard)
+
+
+def _notify_admin_deposit(key, record):
+    text = (
+        f"🪙 New Deposit Request\n"
+        f"Name: {record.get('name')}\n"
+        f"Amount: {record.get('amount')} ETB\n"
+        f"Ref/txn ID: {record.get('txnId')}\n"
+        f"SMS:\n{record.get('smsText')}\n"
+    )
+    debug = record.get("debug")
+    if debug:
+        # Real evidence of why auto-verify couldn't confirm this one --
+        # lets us actually fix the parser instead of guessing.
+        text += f"\n🔧 Auto-verify debug: {debug}\n"
+    text += f"Request ID: {key}"
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Approve", callback_data=f"approve:deposit:{key}"),
+        InlineKeyboardButton("❌ Reject", callback_data=f"reject:deposit:{key}"),
     ]])
     _send_to_admin(text, keyboard)
 
