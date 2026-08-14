@@ -1055,9 +1055,9 @@ async def withdraw_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Daily Report
 # ============================================================
 # What time to send the automatic daily report, in UTC (Render's server
-# clock is UTC). 17:00 UTC = 20:00 East Africa Time (UTC+3) — end of a
-# typical day. Change this single number to move the report time.
-REPORT_HOUR_UTC = 17
+# clock is UTC). 16:00 UTC = 19:00 East Africa Time (UTC+3) — "ማታ 1 ሰዓት".
+# Change this single number to move the report time.
+REPORT_HOUR_UTC = 16
 
 
 def _sum_today(ref, day_str: str) -> Tuple[float, int]:
@@ -1092,6 +1092,46 @@ def _count_new_users_today(day_str: str) -> int:
     return count
 
 
+def _list_deposits_today(day_str: str) -> list:
+    """Returns a list of every deposit record under deposits_ref (i.e. every
+    admin-approved deposit) whose 'timestamp' falls on day_str (YYYY-MM-DD),
+    each as a dict with name/phone/by(user id)/amount — for the detailed
+    per-deposit section of the daily report."""
+    records = deposits_ref.get() or {}
+    result = []
+    for rec in records.values():
+        if not isinstance(rec, dict):
+            continue
+        ts = rec.get("timestamp", "") or ""
+        if ts.startswith(day_str):
+            result.append({
+                "name": rec.get("name", "N/A"),
+                "phone": rec.get("phone", "N/A"),
+                "by": rec.get("by", "N/A"),
+                "amount": rec.get("amount", 0),
+            })
+    return result
+
+
+def _chunk_text(text: str, limit: int = 4000) -> list:
+    """Splits text into chunks under Telegram's 4096-char message limit,
+    breaking on line boundaries so no single deposit entry gets cut in half."""
+    lines = text.split("\n")
+    chunks = []
+    current = ""
+    for line in lines:
+        candidate = (current + "\n" + line) if current else line
+        if len(candidate) > limit:
+            if current:
+                chunks.append(current)
+            current = line
+        else:
+            current = candidate
+    if current:
+        chunks.append(current)
+    return chunks
+
+
 async def send_daily_report(bot, chat_id: int = ADMIN_CHAT_ID, day_str: Optional[str] = None):
     day_str = day_str or datetime.now().strftime("%Y-%m-%d")
     total_deposits, deposit_count = _sum_today(deposits_ref, day_str)
@@ -1109,6 +1149,27 @@ async def send_daily_report(bot, chat_id: int = ADMIN_CHAT_ID, day_str: Optional
         await bot.send_message(chat_id=chat_id, text=text)
     except Exception as e:
         log.error(f"Failed to send daily report: {e}")
+
+    # Follow-up message: detailed list of every deposit made today.
+    deposits_today = _list_deposits_today(day_str)
+    if not deposits_today:
+        return
+
+    lines = [f"📋 ዝርዝር ዲፖዚት - {day_str}\n"]
+    for i, d in enumerate(deposits_today, start=1):
+        lines.append(
+            f"{i}. ስም: {d['name']}\n"
+            f"   ስልክ: {d['phone']}\n"
+            f"   ID: {d['by']}\n"
+            f"   የብር መጠን: {d['amount']:.2f} ብር\n"
+        )
+    detail_text = "\n".join(lines)
+
+    for chunk in _chunk_text(detail_text):
+        try:
+            await bot.send_message(chat_id=chat_id, text=chunk)
+        except Exception as e:
+            log.error(f"Failed to send detailed deposit report chunk: {e}")
 
 
 async def dailyreport_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
