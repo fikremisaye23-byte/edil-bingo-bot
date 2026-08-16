@@ -72,6 +72,7 @@ deposits_ref = db.reference("transactions/deposits")
 withdrawals_ref = db.reference("transactions/withdrawals")
 used_deposit_ids_ref = db.reference("transactions/usedDepositIds")
 pending_deposits_ref = db.reference("transactions/pendingDeposits")
+deposit_rate_limits_ref = db.reference("transactions/depositRateLimits")
 
 # ============================================================
 # Wallet Functions (FIXED)
@@ -135,6 +136,31 @@ def _credit_deposit_wallet(user_id: str, amount: float) -> Tuple[bool, Optional[
     return _update_wallet(user_id, play_delta=amount, deposited_delta=amount)
 
 
+def _sms_amount_mismatch(record: Dict[str, Any]) -> Optional[float]:
+    """Compares the amount the user stated in-chat against the amount the
+    bot parsed out of their pasted Telebirr SMS (stored on the pending
+    record as parsed_data.transfer_amount at submission time). Returns the
+    SMS amount if it differs from the stated amount by more than a small
+    rounding tolerance, so the caller can hold off crediting and ask the
+    admin to confirm; returns None if they match (or the SMS amount could
+    not be read, in which case there's nothing to compare against)."""
+    parsed = record.get("parsed_data") or {}
+    sms_amount_raw = parsed.get("transfer_amount")
+    if not sms_amount_raw:
+        return None
+    try:
+        sms_amount = float(sms_amount_raw)
+    except (TypeError, ValueError):
+        return None
+    try:
+        stated_amount = float(record.get("amount", 0) or 0)
+    except (TypeError, ValueError):
+        return None
+    if abs(sms_amount - stated_amount) > 1:  # >1 ብር tolerance for rounding
+        return sms_amount
+    return None
+
+
 def _debit_withdrawal(user_id: str, amount: float) -> Tuple[bool, Optional[str]]:
     return _update_wallet(user_id, main_delta=-amount)
 
@@ -146,8 +172,9 @@ def _refund_withdrawal(user_id: str, amount: float) -> Tuple[bool, Optional[str]
 # ============================================================
 # Rate Limiting
 # ============================================================
-_deposit_attempt_times = {}
-_deposit_attempt_lock = threading.Lock()
+# Persisted in Firebase (transactions/depositRateLimits/{user_id}) rather
+# than kept in a plain in-memory dict, so the limit survives a bot
+# restart/redeploy on Render instead of silently resetting to zero.
 DEPOSIT_RATE_LIMIT_MAX = 5
 DEPOSIT_RATE_LIMIT_WINDOW = 600
 AUTO_APPROVE_MAX_AMOUNT = 2000
@@ -155,11 +182,23 @@ AUTO_APPROVE_MAX_AMOUNT = 2000
 
 def _deposit_rate_limited(user_id: str) -> bool:
     now = time.time()
-    with _deposit_attempt_lock:
-        recent = [t for t in _deposit_attempt_times.get(user_id, []) if now - t < DEPOSIT_RATE_LIMIT_WINDOW]
+    limited_holder = {"limited": False}
+
+    def update(current):
+        recent = [t for t in (current or []) if now - t < DEPOSIT_RATE_LIMIT_WINDOW]
         recent.append(now)
-        _deposit_attempt_times[user_id] = recent
-        return len(recent) > DEPOSIT_RATE_LIMIT_MAX
+        limited_holder["limited"] = len(recent) > DEPOSIT_RATE_LIMIT_MAX
+        return recent
+
+    try:
+        deposit_rate_limits_ref.child(str(user_id)).transaction(update)
+    except Exception as e:
+        # Fail open on infra errors, same spirit as the old in-memory
+        # version -- a rate-limit outage shouldn't block real deposits.
+        log.error(f"Rate limit check failed for {user_id}: {e}")
+        return False
+
+    return limited_holder["limited"]
 
 
 # ============================================================
@@ -192,6 +231,8 @@ def parse_telebirr_sms_improved(text: str) -> Optional[Dict[str, Any]]:
         r'([\d,]+(?:\.\d+)?)\s*ETB',
         r'([\d,]+(?:\.\d+)?)\s*Birr',
         r'([\d,]+(?:\.\d+)?)\s*Br',
+        r'ETB\s*([\d,]+(?:\.\d+)?)',
+        r'Birr\s*([\d,]+(?:\.\d+)?)',
         r'amount[:\s]*([\d,]+(?:\.\d+)?)',
     ]
     
@@ -205,23 +246,31 @@ def parse_telebirr_sms_improved(text: str) -> Optional[Dict[str, Any]]:
             except ValueError:
                 continue
     
+    # Find a phone-like substring (masked like "251*...0399" or a plain
+    # 10-digit number), then normalize to just its last 4 digits. Doing the
+    # digit-suffix extraction here in Python — instead of relying on each
+    # regex to capture the right group — avoids a crash: two of these
+    # patterns have no capturing group at all, so calling .group(1) on a
+    # match from them raises IndexError and would take the whole handler
+    # down for any SMS with an unmasked phone number.
     phone_patterns = [
-        r'\(?251\d\*+(\d{2,4})\)?',
+        r'\(?251\d\*+\d{2,4}\)?',
         r'0?9\d{8}',
         r'2519\d{8}',
     ]
-    phone_match = None
+    phone_suffix = ""
     for pattern in phone_patterns:
         match = re.search(pattern, text)
         if match:
-            phone_match = match
+            digits_only = re.sub(r'\D', '', match.group(0))
+            phone_suffix = digits_only[-4:] if len(digits_only) >= 4 else digits_only
             break
     
     txn_patterns = [
         r'ቁጥርዎ\s*(\S+)\s*ነ[ዉው]',
         r'የሂሳብ እንቅስቃሴ ቁጥርዎ\s*(\S+)',
-        r'Transaction\s*(?:ID|No|Number)[:\s]*([A-Z0-9]+)',
-        r'Ref(?:erence)?[:\s]*([A-Z0-9]+)',
+        r'Transaction\s*(?:ID|No|Number)[:\s]*(?:is[:\s]*)?([A-Z0-9]{6,20})',
+        r'Ref(?:erence)?[:\s]*([A-Z0-9]{6,20})',
         r'([A-Z0-9]{8,14})\s*(?:ነዉ|ነው|is|$)',
     ]
     
@@ -233,15 +282,32 @@ def parse_telebirr_sms_improved(text: str) -> Optional[Dict[str, Any]]:
             break
     
     receipt_match = re.search(r'transactioninfo\.ethiotelecom\.et/receipt/([A-Za-z0-9]+)', text)
-    
+
+    name_match = re.search(r'\bto\s+([A-Za-z][A-Za-z\.\s]{1,40}?)\s*\(', text)
+
+    # The actual amount the person sent — not the service fee, VAT, or
+    # resulting account balance that also appear (and also match) elsewhere
+    # in the same SMS. Look specifically at the figure tied to "transferred".
+    transferred_match = re.search(
+        r'transferred\s+(?:ETB|Birr|ብር)?\s*([\d,]+(?:\.\d+)?)', text, re.IGNORECASE
+    )
+    if transferred_match:
+        transfer_amount = transferred_match.group(1).replace(',', '')
+    elif amounts:
+        transfer_amount = str(amounts[0])
+    else:
+        transfer_amount = None
+
     if not amounts and not txn_match:
         return None
     
     return {
         "amounts": amounts,
-        "phone": phone_match.group(1) if phone_match else "",
+        "transfer_amount": transfer_amount,
+        "phone": phone_suffix,
         "txn_id": txn_match.group(1) if txn_match else None,
         "receipt_id": receipt_match.group(1) if receipt_match else None,
+        "recipient_name": name_match.group(1).strip() if name_match else "",
         "raw_text": text,
     }
 
@@ -394,6 +460,18 @@ def admin_deposit_keyboard(deposit_key: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("✅ Approve", callback_data=f"approve:deposit:{deposit_key}"),
+            InlineKeyboardButton("❌ Reject", callback_data=f"reject:deposit:{deposit_key}"),
+        ]
+    ])
+
+
+def admin_deposit_force_keyboard(deposit_key: str) -> InlineKeyboardMarkup:
+    # Shown only after an amount mismatch warning — requires a deliberate
+    # second tap so a mismatched deposit is never credited by the same
+    # single tap as a normal, matching one.
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("⚠️ Approve Anyway", callback_data=f"approveforce:deposit:{deposit_key}"),
             InlineKeyboardButton("❌ Reject", callback_data=f"reject:deposit:{deposit_key}"),
         ]
     ])
@@ -579,6 +657,54 @@ async def deposit_payment_handler(update: Update, context: ContextTypes.DEFAULT_
     )
 
 
+async def _finalize_deposit_approval(context, query, record: Dict[str, Any], key: str):
+    """Credits the wallet, records the approved deposit, and notifies both
+    the admin and the user. Shared by the normal 'approve' path and the
+    'approveforce' path (used after an amount-mismatch warning) so the
+    crediting logic only exists once."""
+    amount = record.get("amount", 0)
+    user_id = record.get("by")
+    name = record.get("name", "Player")
+
+    success, err = _credit_deposit_wallet(user_id, amount)
+    if not success:
+        await query.edit_message_text(f"❌ Failed to credit wallet: {err}")
+        return
+
+    pending_deposits_ref.child(key).update({
+        "status": "approved",
+        "approved_at": datetime.now().isoformat(),
+        "approved_by": "admin"
+    })
+
+    deposits_ref.push({
+        "by": user_id,
+        "name": name,
+        "amount": amount,
+        "phone": record.get("phone", ""),
+        "txnId": record.get("txnId", ""),
+        "status": "approved",
+        "autoVerified": False,
+        "adminApproved": True,
+        "timestamp": datetime.now().isoformat(),
+    })
+
+    await query.edit_message_text(
+        f"✅ Approved deposit of {amount:.2f} ብር for {name}.\n"
+        f"Ref: {record.get('txnId', 'N/A')}"
+    )
+
+    try:
+        await context.bot.send_message(
+            chat_id=user_id,
+            text=f"✅ የ {amount:.2f} ብር ዲፖዚት ጥያቄዎ ጸድቋል!\n"
+                 f"በ Play Wallet ውስጥ ገንዘብዎ ተጨምሯል።\n\n"
+                 f"Ref: {record.get('txnId', 'N/A')}"
+        )
+    except Exception as e:
+        log.warning(f"Could not notify user of deposit approval: {e}")
+
+
 async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await _safe_answer(query)
@@ -606,48 +732,30 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         if action == "approve":
-            amount = record.get("amount", 0)
-            user_id = record.get("by")
-            name = record.get("name", "Player")
-            
-            success, err = _credit_deposit_wallet(user_id, amount)
-            if not success:
-                await query.edit_message_text(f"❌ Failed to credit wallet: {err}")
-                return
-            
-            pending_deposits_ref.child(key).update({
-                "status": "approved",
-                "approved_at": datetime.now().isoformat(),
-                "approved_by": "admin"
-            })
-            
-            deposits_ref.push({
-                "by": user_id,
-                "name": name,
-                "amount": amount,
-                "phone": record.get("phone", ""),
-                "txnId": record.get("txnId", ""),
-                "status": "approved",
-                "autoVerified": False,
-                "adminApproved": True,
-                "timestamp": datetime.now().isoformat(),
-            })
-            
-            await query.edit_message_text(
-                f"✅ Approved deposit of {amount:.2f} ብር for {name}.\n"
-                f"Ref: {record.get('txnId', 'N/A')}"
-            )
-            
-            try:
-                await context.bot.send_message(
-                    chat_id=user_id,
-                    text=f"✅ የ {amount:.2f} ብር ዲፖዚት ጥያቄዎ ጸድቋል!\n"
-                         f"በ Play Wallet ውስጥ ገንዘብዎ ተጨምሯል።\n\n"
-                         f"Ref: {record.get('txnId', 'N/A')}"
+            # Don't credit yet if the stated amount and the SMS-parsed amount
+            # disagree -- that mismatch is exactly the case a human reviewer
+            # exists to catch. Surface it and require a deliberate second
+            # tap ("Approve Anyway") instead of crediting on the first tap.
+            mismatched_sms_amount = _sms_amount_mismatch(record)
+            if mismatched_sms_amount is not None:
+                stated_amount = record.get("amount", 0)
+                await query.edit_message_text(
+                    f"⚠️ Amount mismatch for {record.get('name', 'Player')}!\n\n"
+                    f"Stated (by user): {stated_amount} ብር\n"
+                    f"Parsed from SMS: {mismatched_sms_amount:.2f} ብር\n"
+                    f"Ref: {record.get('txnId', 'N/A')}\n\n"
+                    f"Double-check the SMS before approving.",
+                    reply_markup=admin_deposit_force_keyboard(key),
                 )
-            except Exception as e:
-                log.warning(f"Could not notify user of deposit approval: {e}")
-                
+                return
+
+            await _finalize_deposit_approval(context, query, record, key)
+
+        elif action == "approveforce":
+            # Admin already saw the mismatch warning and confirmed -- credit
+            # using the stated amount, same as a normal approval.
+            await _finalize_deposit_approval(context, query, record, key)
+
         else:
             pending_deposits_ref.child(key).update({
                 "status": "rejected",
@@ -834,6 +942,21 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
+        # Check whether the SMS shows the money was sent to one of our three
+        # registered Telebirr numbers (matched on the masked suffix digits
+        # Telebirr includes in the SMS, e.g. "0399" for "...0399"). This does
+        # NOT block the deposit — our phone-format detection can't cover
+        # every SMS wording, so a false negative here would wrongly reject a
+        # legitimate deposit. Instead we surface the result to the admin
+        # (below) so the human reviewer makes the final call.
+        sms_phone_suffix = (parsed.get("phone") or "").strip()
+        phone_ok = False
+        if sms_phone_suffix:
+            for num in TELEBIRR_NUMBERS:
+                if num["phone"].endswith(sms_phone_suffix):
+                    phone_ok = True
+                    break
+
         # Atomically check-and-reserve this receipt/transaction ID before doing
         # anything else. A plain .get() read-then-decide here would leave a race
         # window: two near-simultaneous submissions of the same SMS (or the same
@@ -893,14 +1016,20 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         try:
             keyboard = admin_deposit_keyboard(pending_key)
+            sms_amount_str = parsed.get("transfer_amount") or "N/A"
+            sms_name = parsed.get("recipient_name") or "N/A"
+            phone_flag = "✅ Match" if phone_ok else "⚠️ No match / not detected"
             await context.bot.send_message(
                 chat_id=ADMIN_CHAT_ID,
                 text=(
                     f"🪙 New Deposit Request\n"
-                    f"Name: {data.get('name', 'Player')}\n"
-                    f"Amount: {stated_amount} ብር\n"
+                    f"Name (registered): {data.get('name', 'Player')}\n"
+                    f"Amount (stated): {stated_amount} ብር\n"
+                    f"Amount (from SMS): {sms_amount_str} ብር\n"
+                    f"Recipient name (from SMS): {sms_name}\n"
                     f"Txn ID: {receipt_no}\n"
-                    f"Phone: {data.get('payToPhone', '')}\n\n"
+                    f"Phone: {data.get('payToPhone', '')}\n"
+                    f"Phone match check: {phone_flag}\n\n"
                     f"📝 SMS:\n{text[:500]}"
                 ),
                 reply_markup=keyboard,
@@ -1237,7 +1366,7 @@ def main():
 
     app.add_handler(CallbackQueryHandler(menu_handler, pattern=r"^menu:"))
     app.add_handler(CallbackQueryHandler(deposit_payment_handler, pattern=r"^deppay:"))
-    app.add_handler(CallbackQueryHandler(handle_button, pattern=r"^(approve|reject):"))
+    app.add_handler(CallbackQueryHandler(handle_button, pattern=r"^(approve|approveforce|reject):"))
 
     app.add_handler(MessageHandler(filters.CONTACT, contact_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
