@@ -1328,6 +1328,123 @@ def _daily_report_scheduler(loop):
 
 
 # ============================================================
+# Server-side Bingo Round Caller
+# ------------------------------------------------------------
+# Previously, number-calling was driven entirely by whichever player's
+# phone/browser got elected "caller" in index.html. If that player
+# locked their screen or backgrounded Telegram, mobile browsers
+# throttle background timers and calling would stall for up to ~20s
+# until another player's device took over. This background thread
+# replaces that with a single, always-on server-side caller so calling
+# never depends on any individual player's device.
+#
+# index.html's own acquireRoundCaller()/attemptCallNextNumber() have
+# been disabled to match -- only this loop now writes to
+# room/calledNumbers and room/prizePool. Winner detection and payout
+# stay exactly as they were, client-side.
+# ============================================================
+ROUND_CARD_SELECTION_SECONDS = 45  # must match CARD_SELECTION_SECONDS in index.html
+ROUND_CALL_INTERVAL_SECONDS = 3    # must match the 3000ms cadence in index.html
+
+_last_handled_round_id = None
+_current_round_calling = False
+
+
+def _compute_and_publish_prize_pool(room_ref):
+    """Reads room/takenCards, computes 80% of total stake, writes
+    room/prizePool if it hasn't already been set for this round --
+    mirrors the old client-side acquireRoundCaller() logic exactly."""
+    taken = room_ref.child("takenCards").get() or {}
+    pool_base = 0.0
+    for card in taken.values():
+        try:
+            pool_base += float((card or {}).get("stake", 0) or 0)
+        except (TypeError, ValueError):
+            pass
+    pool = pool_base * 0.8
+
+    def txn(current):
+        if current and current > 0:
+            return current
+        return pool
+
+    room_ref.child("prizePool").transaction(txn)
+
+
+def _call_next_number(room_ref):
+    """Adds one new unique number (1-75) to room/calledNumbers via a
+    Firebase transaction -- same algorithm attemptCallNextNumber() used
+    to run client-side."""
+    def txn(current):
+        current_list = list(current or [])
+        if len(current_list) >= 75:
+            return current_list
+        next_num = random.randint(1, 75)
+        attempts = 0
+        while next_num in current_list and attempts < 200:
+            next_num = random.randint(1, 75)
+            attempts += 1
+        if next_num in current_list:
+            return current_list
+        current_list.append(next_num)
+        return current_list
+
+    result = room_ref.child("calledNumbers").transaction(txn)
+    if result is not None:
+        room_ref.child("lastCallAt").set(int(time.time() * 1000))
+
+
+def _run_one_round(room_ref, round_id):
+    """Blocks this background thread for the lifetime of one round: waits
+    out the shared card-selection window, publishes the prize pool once,
+    then calls numbers every few seconds until 75 numbers are out or a
+    winner ends the round (room/roundEnded, set client-side as before)."""
+    global _current_round_calling
+    _current_round_calling = True
+    try:
+        elapsed_ms = time.time() * 1000 - round_id
+        remaining_s = (ROUND_CARD_SELECTION_SECONDS * 1000 - elapsed_ms) / 1000.0
+        if remaining_s > 0:
+            time.sleep(remaining_s + 0.5)  # small buffer past the client deadline
+
+        if room_ref.child("roundEnded").get() is True:
+            return  # round already wrapped up (e.g. no cards were taken)
+
+        _compute_and_publish_prize_pool(room_ref)
+
+        while True:
+            if room_ref.child("roundEnded").get() is True:
+                return
+            called = room_ref.child("calledNumbers").get() or []
+            if len(called) >= 75:
+                return
+            _call_next_number(room_ref)
+            time.sleep(ROUND_CALL_INTERVAL_SECONDS)
+    except Exception as e:
+        log.error(f"Round caller failed for round {round_id}: {e}")
+    finally:
+        _current_round_calling = False
+
+
+def _round_watcher_loop():
+    """Runs for the lifetime of the process. Polls room/roundId and starts
+    a new calling cycle whenever a new round begins -- replacing the old
+    per-player 'elected caller' scheme entirely."""
+    global _last_handled_round_id
+    room_ref = db.reference("room")
+    while True:
+        try:
+            if not _current_round_calling:
+                round_id = room_ref.child("roundId").get()
+                if round_id and round_id != _last_handled_round_id:
+                    _last_handled_round_id = round_id
+                    _run_one_round(room_ref, round_id)
+        except Exception as e:
+            log.error(f"Round watcher loop error: {e}")
+        time.sleep(1)
+
+
+# ============================================================
 # Error Handler
 # ============================================================
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1346,6 +1463,9 @@ async def on_startup(application):
     log.info("Event loop captured; admin notifications are now live.")
     threading.Thread(target=_daily_report_scheduler, args=(main_loop,), daemon=True).start()
     log.info(f"Daily report scheduler started (sends at {REPORT_HOUR_UTC}:00 UTC).")
+
+    threading.Thread(target=_round_watcher_loop, daemon=True).start()
+    log.info("Bingo round caller started (server-side number calling).")
 
 
 def main():
