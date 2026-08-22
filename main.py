@@ -5,6 +5,8 @@ Temerachi Bingo - Admin Bot (Production Version - Fixed)
 """
 
 import asyncio
+import hashlib
+import hmac
 import json
 import logging
 import os
@@ -16,11 +18,12 @@ import urllib.request
 import urllib.error
 from datetime import datetime, timedelta
 from typing import Optional, Tuple, Dict, Any
+from urllib.parse import parse_qsl
 
 import firebase_admin
 import telegram
-from firebase_admin import credentials, db
-from flask import Flask
+from firebase_admin import auth as firebase_auth, credentials, db
+from flask import Flask, jsonify, request
 from telegram import (
     Update,
     InlineKeyboardButton,
@@ -493,6 +496,96 @@ def health():
     return {"status": "healthy", "timestamp": datetime.now().isoformat()}
 
 
+# ============================================================
+# Mini App Authentication
+# ------------------------------------------------------------
+# The Mini App used to sign into Firebase anonymously, then trust whatever
+# Telegram.WebApp.initDataUnsafe.user.id it read client-side as the
+# identity for every wallet read/write. initDataUnsafe is exactly that --
+# unsafe -- it isn't cryptographically checked, so it can be edited in the
+# browser before the page reads it. Combined with open Firebase rules
+# (any authenticated client, including an anonymous one, could read/write
+# any path), this meant anyone could act as any user's wallet.
+#
+# This endpoint verifies initData the way Telegram documents: recompute
+# the HMAC-SHA256 hash Telegram signs it with (using the bot token as the
+# secret) and compare. Only if that matches do we mint a Firebase custom
+# token for that exact Telegram user id, which the Mini App then signs in
+# with instead of anonymous auth. Firebase rules (updated separately, in
+# the Firebase console) can then require auth.uid == the wallet's own
+# path, which anonymous auth could never satisfy.
+# ============================================================
+def _verify_telegram_init_data(init_data: str, max_age_seconds: int = 86400) -> Optional[str]:
+    """Returns the Telegram user id (as a string) if init_data is a
+    genuine, sufficiently-recent payload from Telegram for this bot;
+    None if the signature is missing/wrong or the data is stale."""
+    if not init_data:
+        return None
+    try:
+        parsed = dict(parse_qsl(init_data, strict_parsing=True))
+    except ValueError:
+        return None
+
+    received_hash = parsed.pop("hash", None)
+    if not received_hash:
+        return None
+
+    data_check_string = "\n".join(f"{k}={v}" for k, v in sorted(parsed.items()))
+    secret_key = hmac.new(b"WebAppData", BOT_TOKEN.encode(), hashlib.sha256).digest()
+    computed_hash = hmac.new(secret_key, data_check_string.encode(), hashlib.sha256).hexdigest()
+
+    if not hmac.compare_digest(computed_hash, received_hash):
+        return None
+
+    auth_date = parsed.get("auth_date")
+    try:
+        if not auth_date or (time.time() - int(auth_date)) > max_age_seconds:
+            return None
+    except (TypeError, ValueError):
+        return None
+
+    try:
+        user_obj = json.loads(parsed.get("user", "{}"))
+        user_id = user_obj.get("id")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+    return str(user_id) if user_id else None
+
+
+def _cors(resp):
+    # Mini App is hosted on GitHub Pages, this bot on Render -- different
+    # origins, so the browser needs this to allow the fetch() call at all.
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    resp.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
+    resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    return resp
+
+
+@flask_app.route("/webapp-auth", methods=["POST", "OPTIONS"])
+def webapp_auth():
+    if request.method == "OPTIONS":
+        return _cors(flask_app.make_default_options_response())
+
+    body = request.get_json(silent=True) or {}
+    user_id = _verify_telegram_init_data(body.get("initData", ""))
+    if not user_id:
+        resp = jsonify({"error": "invalid or expired initData"})
+        resp.status_code = 401
+        return _cors(resp)
+
+    try:
+        token = firebase_auth.create_custom_token(user_id)
+        token_str = token.decode("utf-8") if isinstance(token, bytes) else token
+    except Exception as e:
+        log.error(f"Failed to mint custom token for {user_id}: {e}")
+        resp = jsonify({"error": "token mint failed"})
+        resp.status_code = 500
+        return _cors(resp)
+
+    return _cors(jsonify({"token": token_str, "userId": user_id}))
+
+
 def run_web_server():
     flask_app.run(host="0.0.0.0", port=8080)
 
@@ -583,10 +676,23 @@ async def _run_menu_action(action: str, reply_target, user, context):
     elif action == "withdraw":
         wallet = _get_wallet_safe(user_id)
         main_bal = wallet.get("main", 0)
+        deposited_bal = wallet.get("deposited", 0)
         if main_bal <= 0:
             await reply_target.reply_text(
                 "⚠️ Your main wallet is empty, there's nothing to withdraw.\n\n"
                 f"💰 Main wallet: {main_bal:.2f} ብር"
+            )
+            return
+        # Bonus-only players (never made a real Telebirr deposit) cannot
+        # withdraw winnings won purely off the free registration bonus --
+        # they must deposit first. Mirrors the same check added in
+        # index.html's handleWithdraw(), here too so it can't be bypassed
+        # by going through the bot chat directly instead of the Mini App's
+        # Withdraw button.
+        if deposited_bal <= 0:
+            await reply_target.reply_text(
+                "🚫 Withdraw ለማድረግ መጀመሪያ ቢያንስ አንድ ጊዜ ዲፖዚት ማድረግ አለብዎት።",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🪙 Deposit", callback_data="menu:deposit")]]),
             )
             return
         context.user_data["flow"] = "withdraw_amount"
@@ -867,14 +973,34 @@ async def contact_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     name = (user.first_name or "") + (" " + user.last_name if user.last_name else "")
     name = name.strip() or "Player"
 
+    # The 10-birr registration bonus used to only be granted by the Mini
+    # App's own handleRegister(). A player who registers here in the bot
+    # chat first (sharing their contact) never got it, and the Mini App
+    # would then see registered=true already and skip granting it too --
+    # leaving them with a real "registered" account but a 0 balance. Grant
+    # it here as well, guarded on the same "registered" flag both paths
+    # already share, so it's still only ever given once no matter which
+    # path a player registers through first.
+    existing_record = db.reference(f"users/{user_id}").get() or {}
+    already_registered = bool(existing_record.get("registered"))
+
     db.reference(f"users/{user_id}").update({
         "name": name,
         "phone": contact.phone_number,
         "registered": True,
-        "registered_at": datetime.now().isoformat(),
+        "registered_at": existing_record.get("registered_at") or datetime.now().isoformat(),
     })
+
+    bonus_note = ""
+    if not already_registered:
+        success, err = _update_wallet(user_id, play_delta=10)
+        if success:
+            bonus_note = "\n🎉 10 free fun coins have been added to your balance."
+        else:
+            log.error(f"Failed to grant registration bonus to {user_id}: {err}")
+
     await update.message.reply_text(
-        f"✅ Registered! Welcome, {name}.",
+        f"✅ Registered! Welcome, {name}.{bonus_note}",
         reply_markup=ReplyKeyboardRemove(),
     )
     await update.message.reply_text(
