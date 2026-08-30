@@ -14,8 +14,6 @@ import random
 import re
 import threading
 import time
-import urllib.request
-import urllib.error
 from datetime import datetime, timedelta
 from typing import Optional, Tuple, Dict, Any
 from urllib.parse import parse_qsl
@@ -180,7 +178,6 @@ def _refund_withdrawal(user_id: str, amount: float) -> Tuple[bool, Optional[str]
 # restart/redeploy on Render instead of silently resetting to zero.
 DEPOSIT_RATE_LIMIT_MAX = 5
 DEPOSIT_RATE_LIMIT_WINDOW = 600
-AUTO_APPROVE_MAX_AMOUNT = 2000
 
 
 def _deposit_rate_limited(user_id: str) -> bool:
@@ -313,99 +310,6 @@ def parse_telebirr_sms_improved(text: str) -> Optional[Dict[str, Any]]:
         "recipient_name": name_match.group(1).strip() if name_match else "",
         "raw_text": text,
     }
-
-
-def fetch_telebirr_receipt_improved(receipt_no: str) -> Optional[Dict[str, Any]]:
-    url = f"https://transactioninfo.ethiotelecom.et/receipt/{receipt_no}"
-    
-    user_agents = [
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    ]
-    
-    for ua in user_agents:
-        try:
-            req = urllib.request.Request(url, headers={"User-Agent": ua})
-            with urllib.request.urlopen(req, timeout=20) as resp:
-                html = resp.read().decode("utf-8", errors="ignore")
-                break
-        except Exception as e:
-            log.warning(f"User-Agent {ua[:30]}... failed: {e}")
-            continue
-    else:
-        log.warning(f"All User-Agents failed for {receipt_no}")
-        return None
-    
-    result = {"amount": None, "all_phones": [], "date_text": None, "status": "unknown"}
-    
-    amount_patterns = [
-        r'([\d,]+(?:\.\d+)?)\s*(?:ETB|Birr|ብር)',
-        r'Amount[:\s]*([\d,]+(?:\.\d+)?)',
-        r'ብር[:\s]*([\d,]+(?:\.\d+)?)',
-        r'([\d,]+(?:\.\d+)?)\s*ETB',
-    ]
-    
-    for pattern in amount_patterns:
-        match = re.search(pattern, html, re.IGNORECASE)
-        if match:
-            try:
-                result["amount"] = float(match.group(1).replace(",", ""))
-                break
-            except ValueError:
-                continue
-    
-    phone_patterns = [
-        r'(?:251)?0?9\d{8}',
-        r'\+\d{1,3}0?9\d{8}',
-    ]
-    all_phones = []
-    for pattern in phone_patterns:
-        phones = re.findall(pattern, html)
-        all_phones.extend(phones)
-    result["all_phones"] = list(set(all_phones))
-    
-    date_patterns = [
-        r'(\d{1,2}[/-]\d{1,2}[/-]\d{4}[,\s]+\d{1,2}:\d{2}(?::\d{2})?)',
-        r'(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})',
-        r'(\d{1,2}/\d{1,2}/\d{4}\s+\d{1,2}:\d{2})',
-    ]
-    for pattern in date_patterns:
-        match = re.search(pattern, html)
-        if match:
-            result["date_text"] = match.group(1)
-            break
-    
-    if "successful" in html.lower() or "completed" in html.lower() or "confirmed" in html.lower():
-        result["status"] = "success"
-    elif "failed" in html.lower() or "rejected" in html.lower():
-        result["status"] = "failed"
-    else:
-        result["status"] = "unknown"
-    
-    if result["amount"] is None:
-        log.warning(f"Could not extract amount from receipt page for {receipt_no}")
-        return None
-    
-    return result
-
-
-def fetch_telebirr_receipt_with_retry_improved(
-    receipt_no: str, max_wait_seconds: int = 120, poll_interval: int = 5
-) -> Optional[Dict[str, Any]]:
-    deadline = time.time() + max_wait_seconds
-    attempt = 0
-    while True:
-        attempt += 1
-        log.info(f"Fetching receipt {receipt_no} attempt {attempt}")
-        receipt = fetch_telebirr_receipt_improved(receipt_no)
-        if receipt is not None:
-            log.info(f"Receipt {receipt_no} found on attempt {attempt}")
-            return receipt
-        if time.time() >= deadline:
-            log.info(f"Giving up on receipt {receipt_no} after {attempt} attempts")
-            return None
-        time.sleep(poll_interval)
 
 
 # ============================================================
@@ -1609,6 +1513,73 @@ def _call_next_number(room_ref):
         room_ref.child("lastCallAt").set({".sv": "timestamp"})
 
 
+def _matrix_has_win(matrix, called_set):
+    """Same five win patterns as index.html's getWinningPattern(): any full
+    row, any full column, either diagonal, or all four corners -- with
+    'FREE' always counting as already-marked."""
+    def hit(v):
+        return v == "FREE" or v in called_set
+
+    for row in matrix:
+        if all(hit(v) for v in row):
+            return True
+    for c in range(5):
+        if all(hit(matrix[r][c]) for r in range(5)):
+            return True
+    if all(hit(matrix[i][i]) for i in range(5)):
+        return True
+    if all(hit(matrix[i][4 - i]) for i in range(5)):
+        return True
+    corners = [matrix[0][0], matrix[0][4], matrix[4][0], matrix[4][4]]
+    if all(hit(v) for v in corners):
+        return True
+    return False
+
+
+def _check_and_finalize_winners(room_ref):
+    """Independently checks every taken card against the numbers called so
+    far and, if any card has a live win, atomically finalizes the round
+    (winnerCards + roundEnded) -- using the exact same room/roundFinalizing
+    transaction lock the client's finalizeRoundWinners() uses, so whichever
+    side (this server thread or a player's browser) gets there first simply
+    wins the race safely; the other's attempt is a harmless no-op. Returns
+    True if this call finalized the round."""
+    taken = room_ref.child("takenCards").get() or {}
+    if not taken:
+        return False
+    called_set = set(room_ref.child("calledNumbers").get() or [])
+    if not called_set:
+        return False
+
+    winners = {}
+    for card_num_str, card in taken.items():
+        matrix = (card or {}).get("matrix")
+        if not matrix:
+            continue
+        try:
+            if _matrix_has_win(matrix, called_set):
+                winners[card_num_str] = {
+                    "by": card.get("by"),
+                    "name": card.get("name"),
+                }
+        except Exception as e:
+            log.warning(f"Win check failed for card {card_num_str}: {e}")
+
+    if not winners:
+        return False
+
+    lock = room_ref.child("roundFinalizing").transaction(
+        lambda current: True if current is not True else current
+    )
+    if not lock:
+        return False  # a client (or this check on a re-run) already won the lock
+
+    room_ref.child("winnerCards").set(winners)
+    room_ref.child("roundEnded").set(True)
+    log.info(f"Server-side winner check finalized round with {len(winners)} winner(s).")
+    return True
+
+
 def _run_one_round(room_ref, round_id):
     """Blocks the calling thread for the lifetime of one round: waits out
     the shared card-selection window, publishes the prize pool once, then
@@ -1641,6 +1612,11 @@ def _run_one_round(room_ref, round_id):
             if len(called) >= 75:
                 return
             _call_next_number(room_ref)
+            # Check independently, right after the new number lands, whether
+            # any taken card now has a live win -- don't rely solely on a
+            # player's own browser to report it.
+            if _check_and_finalize_winners(room_ref):
+                return
             # Each Firebase read/transaction above takes real network time
             # (often a few hundred ms, sometimes more under load). Sleeping
             # a full ROUND_CALL_INTERVAL_SECONDS on top of that -- instead of
