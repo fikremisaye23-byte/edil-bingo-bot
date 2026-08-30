@@ -1435,6 +1435,39 @@ async def dailyreport_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     await send_daily_report(context.bot, chat_id=update.effective_chat.id)
 
 
+async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Admin-only: sends a message to every registered user (users/{user_id}
+    # in Firebase). Usage: /broadcast <message text>
+    if update.effective_user.id != ADMIN_CHAT_ID:
+        return
+
+    # Use the raw message text (not context.args) so multi-line messages
+    # keep their line breaks — context.args whitespace-splits on newlines
+    # too and " ".join() would collapse everything onto one line.
+    raw_text = update.message.text or ""
+    message_text = raw_text[len("/broadcast"):].strip()
+    if not message_text:
+        await update.message.reply_text("Usage: /broadcast <message>")
+        return
+
+    users_snapshot = db.reference("users").get() or {}
+    if not users_snapshot:
+        await update.message.reply_text("No registered users found.")
+        return
+
+    sent, failed = 0, 0
+    for user_id in users_snapshot.keys():
+        try:
+            await context.bot.send_message(chat_id=int(user_id), text=message_text)
+            sent += 1
+        except Exception as e:
+            failed += 1
+            log.warning(f"Broadcast failed for {user_id}: {e}")
+        await asyncio.sleep(0.05)  # avoid hitting Telegram rate limits
+
+    await update.message.reply_text(f"✅ Sent: {sent}  ✗ Failed: {failed}")
+
+
 def _daily_report_scheduler(loop):
     """Runs in a background thread; sleeps until the next REPORT_HOUR_UTC and
     sends the report, forever, once a day."""
@@ -1609,6 +1642,7 @@ def main():
     app.add_handler(CommandHandler("contactsupport", contactsupport_command))
     app.add_handler(CommandHandler("invite", invite_command))
     app.add_handler(CommandHandler("dailyreport", dailyreport_command))
+    app.add_handler(CommandHandler("broadcast", broadcast_command))
 
     app.add_handler(CallbackQueryHandler(menu_handler, pattern=r"^menu:"))
     app.add_handler(CallbackQueryHandler(deposit_payment_handler, pattern=r"^deppay:"))
