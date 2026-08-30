@@ -1579,7 +1579,7 @@ def _firebase_now_ms(room_ref) -> int:
     this server and Firebase can no longer make calling start early/late or
     make a round look stale/not-stale incorrectly."""
     probe_ref = room_ref.child("_serverTimeProbe")
-    probe_ref.set(db.ServerValue.TIMESTAMP)
+    probe_ref.set({".sv": "timestamp"})
     return int(probe_ref.get() or int(time.time() * 1000))
 
 
@@ -1606,7 +1606,7 @@ def _call_next_number(room_ref):
         # Written as a server-timestamp sentinel (not this machine's own
         # time.time()) so clients' staleness checks compare against the
         # same Firebase server clock they're already synced to.
-        room_ref.child("lastCallAt").set(db.ServerValue.TIMESTAMP)
+        room_ref.child("lastCallAt").set({".sv": "timestamp"})
 
 
 def _run_one_round(room_ref, round_id):
