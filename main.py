@@ -767,13 +767,32 @@ async def _finalize_deposit_approval(context, query, record: Dict[str, Any], key
     """Credits the wallet, records the approved deposit, and notifies both
     the admin and the user. Shared by the normal 'approve' path and the
     'approveforce' path (used after an amount-mismatch warning) so the
-    crediting logic only exists once."""
+    crediting logic only exists once.
+
+    Guarded by a Firebase transaction that atomically flips status from
+    "pending" to "processing" before any money moves -- a double-tap on the
+    Approve button, or Telegram redelivering the same callback (which does
+    happen on flaky connections), would otherwise both pass the earlier
+    plain "if status == pending" check and credit the wallet twice."""
     amount = record.get("amount", 0)
     user_id = record.get("by")
     name = record.get("name", "Player")
 
+    record_ref = pending_deposits_ref.child(key)
+    claim = record_ref.transaction(
+        lambda current: {**current, "status": "processing"}
+        if current and current.get("status") == "pending"
+        else current
+    )
+    if not claim or claim.get("status") != "processing":
+        await query.edit_message_text("ℹ️ Already handled (double tap or duplicate action ignored).")
+        return
+
     success, err = _credit_deposit_wallet(user_id, amount)
     if not success:
+        # Roll the claim back to pending so a retry (or the admin approving
+        # again) is still possible after a transient wallet-write failure.
+        record_ref.update({"status": "pending"})
         await query.edit_message_text(f"❌ Failed to credit wallet: {err}")
         return
 
@@ -863,12 +882,16 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _finalize_deposit_approval(context, query, record, key)
 
         else:
-            pending_deposits_ref.child(key).update({
-                "status": "rejected",
-                "rejected_at": datetime.now().isoformat(),
-                "rejected_by": "admin"
-            })
-            
+            record_ref = pending_deposits_ref.child(key)
+            claimed = record_ref.transaction(
+                lambda current: {**current, "status": "rejected", "rejected_at": datetime.now().isoformat(), "rejected_by": "admin"}
+                if current and current.get("status") == "pending"
+                else current
+            )
+            if not claimed or claimed.get("status") != "rejected":
+                await query.edit_message_text("ℹ️ Already handled (double tap or duplicate action ignored).")
+                return
+
             await query.edit_message_text(
                 f"❌ Rejected deposit for {record.get('name', 'User')}.\n"
                 f"Ref: {record.get('txnId', 'N/A')}"
@@ -895,12 +918,16 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         if action == "approve":
-            withdrawals_ref.child(key).update({
-                "status": "approved",
-                "approved_at": datetime.now().isoformat(),
-                "approved_by": "admin"
-            })
-            
+            record_ref = withdrawals_ref.child(key)
+            claimed = record_ref.transaction(
+                lambda current: {**current, "status": "approved", "approved_at": datetime.now().isoformat(), "approved_by": "admin"}
+                if current and current.get("status") == "pending"
+                else current
+            )
+            if not claimed or claimed.get("status") != "approved":
+                await query.edit_message_text("ℹ️ Already handled (double tap or duplicate action ignored).")
+                return
+
             await query.edit_message_text(
                 f"✅ Approved withdrawal of {record.get('amount', 0):.2f} ብር for {record.get('name')}.\n"
                 f"📞 Send to: {record.get('phone')}\n"
@@ -921,10 +948,20 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user_id = str(record["by"])
             amount = record.get("amount", 0)
             name = record.get("name", "User")
-            
+
+            record_ref = withdrawals_ref.child(key)
+            claimed = record_ref.transaction(
+                lambda current: {**current, "status": "processing"}
+                if current and current.get("status") == "pending"
+                else current
+            )
+            if not claimed or claimed.get("status") != "processing":
+                await query.edit_message_text("ℹ️ Already handled (double tap or duplicate action ignored).")
+                return
+
             success, err = _refund_withdrawal(user_id, amount)
             
-            withdrawals_ref.child(key).update({
+            record_ref.update({
                 "status": "rejected",
                 "rejected_at": datetime.now().isoformat(),
                 "rejected_by": "admin",
@@ -1505,8 +1542,10 @@ def _daily_report_scheduler(loop):
 ROUND_CARD_SELECTION_SECONDS = 45  # must match CARD_SELECTION_SECONDS in index.html
 ROUND_CALL_INTERVAL_SECONDS = 3    # must match the 3000ms cadence in index.html
 
-_last_handled_round_id = None
-_current_round_calling = False
+# Play 10 and Play 20 are separate games -- separate round, card selection,
+# caller and prize pool -- each living under its own "room_<stake>" path
+# (see roomRef() in index.html). Must match the stakes chooseStake() offers.
+GAME_STAKES = [10, 20]
 
 
 def _compute_and_publish_prize_pool(room_ref):
@@ -1530,6 +1569,20 @@ def _compute_and_publish_prize_pool(room_ref):
     room_ref.child("prizePool").transaction(txn)
 
 
+def _firebase_now_ms(room_ref) -> int:
+    """Returns Firebase Realtime Database's own current server time (ms),
+    by writing a server-timestamp sentinel to a scratch path and reading
+    back what the server stamped it with. Clients compute their round
+    countdowns against this same Firebase server clock (via a client-side
+    offset probe) -- comparing against it here too, instead of against this
+    machine's own system clock, means a few seconds of clock drift between
+    this server and Firebase can no longer make calling start early/late or
+    make a round look stale/not-stale incorrectly."""
+    probe_ref = room_ref.child("_serverTimeProbe")
+    probe_ref.set(db.ServerValue.TIMESTAMP)
+    return int(probe_ref.get() or int(time.time() * 1000))
+
+
 def _call_next_number(room_ref):
     """Adds one new unique number (1-75) to room/calledNumbers via a
     Firebase transaction -- same algorithm attemptCallNextNumber() used
@@ -1550,19 +1603,28 @@ def _call_next_number(room_ref):
 
     result = room_ref.child("calledNumbers").transaction(txn)
     if result is not None:
-        room_ref.child("lastCallAt").set(int(time.time() * 1000))
+        # Written as a server-timestamp sentinel (not this machine's own
+        # time.time()) so clients' staleness checks compare against the
+        # same Firebase server clock they're already synced to.
+        room_ref.child("lastCallAt").set(db.ServerValue.TIMESTAMP)
 
 
 def _run_one_round(room_ref, round_id):
-    """Blocks this background thread for the lifetime of one round: waits
-    out the shared card-selection window, publishes the prize pool once,
-    then calls numbers every few seconds until 75 numbers are out or a
-    winner ends the round (room/roundEnded, set client-side as before)."""
-    global _current_round_calling
-    _current_round_calling = True
+    """Blocks the calling thread for the lifetime of one round: waits out
+    the shared card-selection window, publishes the prize pool once, then
+    calls numbers every few seconds until 75 numbers are out or a winner
+    ends the round (roundEnded, set client-side as before)."""
     try:
-        elapsed_ms = time.time() * 1000 - round_id
-        remaining_s = (ROUND_CARD_SELECTION_SECONDS * 1000 - elapsed_ms) / 1000.0
+        # Prefer the exact deadline clients are already counting down to
+        # (written once, in Firebase server time, by whoever's device
+        # started the round) over recomputing it from round_id -- and
+        # measure "now" from Firebase's own clock too, so this doesn't
+        # depend on this server's system clock matching Firebase's at all.
+        deadline_ms = room_ref.child("cardSelectionEndTime").get()
+        if not deadline_ms:
+            deadline_ms = round_id + ROUND_CARD_SELECTION_SECONDS * 1000
+        now_ms = _firebase_now_ms(room_ref)
+        remaining_s = (deadline_ms - now_ms) / 1000.0
         if remaining_s > 0:
             time.sleep(remaining_s + 0.5)  # small buffer past the client deadline
 
@@ -1572,34 +1634,47 @@ def _run_one_round(room_ref, round_id):
         _compute_and_publish_prize_pool(room_ref)
 
         while True:
+            loop_start = time.time()
             if room_ref.child("roundEnded").get() is True:
                 return
             called = room_ref.child("calledNumbers").get() or []
             if len(called) >= 75:
                 return
             _call_next_number(room_ref)
-            time.sleep(ROUND_CALL_INTERVAL_SECONDS)
+            # Each Firebase read/transaction above takes real network time
+            # (often a few hundred ms, sometimes more under load). Sleeping
+            # a full ROUND_CALL_INTERVAL_SECONDS on top of that -- instead of
+            # accounting for time already spent -- made the gap between
+            # calls slowly grow past 3s over the course of a round. Sleeping
+            # only for what's left of the interval keeps calls landing on a
+            # steady ~3s cadence regardless of network latency.
+            elapsed = time.time() - loop_start
+            time.sleep(max(0.0, ROUND_CALL_INTERVAL_SECONDS - elapsed))
     except Exception as e:
         log.error(f"Round caller failed for round {round_id}: {e}")
-    finally:
-        _current_round_calling = False
 
 
-def _round_watcher_loop():
-    """Runs for the lifetime of the process. Polls room/roundId and starts
-    a new calling cycle whenever a new round begins -- replacing the old
-    per-player 'elected caller' scheme entirely."""
-    global _last_handled_round_id
-    room_ref = db.reference("room")
+def _round_watcher_loop(stake):
+    """Runs for the lifetime of the process -- one instance per stake,
+    started in on_startup() so Play 10 and Play 20 run as fully
+    independent, concurrent games. Polls room_<stake>/roundId and starts a
+    new calling cycle whenever a new round begins for that stake."""
+    room_ref = db.reference(f"room_{stake}")
+    last_handled_round_id = None
+    round_calling = False
     while True:
         try:
-            if not _current_round_calling:
+            if not round_calling:
                 round_id = room_ref.child("roundId").get()
-                if round_id and round_id != _last_handled_round_id:
-                    _last_handled_round_id = round_id
-                    _run_one_round(room_ref, round_id)
+                if round_id and round_id != last_handled_round_id:
+                    last_handled_round_id = round_id
+                    round_calling = True
+                    try:
+                        _run_one_round(room_ref, round_id)
+                    finally:
+                        round_calling = False
         except Exception as e:
-            log.error(f"Round watcher loop error: {e}")
+            log.error(f"Round watcher loop error (stake {stake}): {e}")
         time.sleep(1)
 
 
@@ -1623,8 +1698,9 @@ async def on_startup(application):
     threading.Thread(target=_daily_report_scheduler, args=(main_loop,), daemon=True).start()
     log.info(f"Daily report scheduler started (sends at {REPORT_HOUR_UTC}:00 UTC).")
 
-    threading.Thread(target=_round_watcher_loop, daemon=True).start()
-    log.info("Bingo round caller started (server-side number calling).")
+    for stake in GAME_STAKES:
+        threading.Thread(target=_round_watcher_loop, args=(stake,), daemon=True).start()
+    log.info(f"Bingo round callers started for stakes {GAME_STAKES} (server-side number calling).")
 
 
 def main():
