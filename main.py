@@ -1453,12 +1453,20 @@ GAME_STAKES = [10, 20]
 
 
 def _compute_and_publish_prize_pool(room_ref):
-    """Reads room/takenCards, computes 80% of total stake, writes
-    room/prizePool if it hasn't already been set for this round --
-    mirrors the old client-side acquireRoundCaller() logic exactly."""
+    """Reads room/takenCards, computes 80% of total stake for cards whose
+    deduction actually committed (paid=true), and writes room/prizePool if
+    it hasn't already been set for this round. Only counting paid cards
+    matters because a card can still be sitting in takenCards as a bare
+    reservation (deduction hasn't run yet) or get released moments after
+    a failed deduction (see releaseSelectedCardsAndSpectate() in
+    index.html) -- neither of those should count toward the pool, and
+    checking paid=true is immune to exactly when that release lands
+    relative to this read, unlike counting takenCards directly would be."""
     taken = room_ref.child("takenCards").get() or {}
     pool_base = 0.0
     for card in taken.values():
+        if not (card or {}).get("paid"):
+            continue
         try:
             pool_base += float((card or {}).get("stake", 0) or 0)
         except (TypeError, ValueError):
@@ -1580,6 +1588,23 @@ def _check_and_finalize_winners(room_ref):
     return True
 
 
+def _sweep_unpaid_reservations(room_ref):
+    """Removes any takenCards entries that never got marked paid=true by
+    the time the round moved past selection -- e.g. a player whose screen
+    locked/app was backgrounded (dropping the Firebase connection, but not
+    a real departure) mid-selection, or someone who genuinely closed the
+    app and never came back. These reservations are no longer released the
+    instant the connection drops (that was releasing cards for players who
+    were still actually playing, just with the screen off for a moment) --
+    this sweep is the replacement cleanup, run once the prize pool has
+    already been computed from paid cards only, so it can never affect the
+    payout even for a reservation that pays a beat too late."""
+    taken = room_ref.child("takenCards").get() or {}
+    for card_num_str, card in taken.items():
+        if not (card or {}).get("paid"):
+            room_ref.child("takenCards").child(card_num_str).delete()
+
+
 def _run_one_round(room_ref, round_id):
     """Blocks the calling thread for the lifetime of one round: waits out
     the shared card-selection window, publishes the prize pool once, then
@@ -1597,12 +1622,13 @@ def _run_one_round(room_ref, round_id):
         now_ms = _firebase_now_ms(room_ref)
         remaining_s = (deadline_ms - now_ms) / 1000.0
         if remaining_s > 0:
-            time.sleep(remaining_s + 0.5)  # small buffer past the client deadline
+            time.sleep(remaining_s + 2.5)  # buffer past the client deadline for deduction/paid writes to land
 
         if room_ref.child("roundEnded").get() is True:
             return  # round already wrapped up (e.g. no cards were taken)
 
         _compute_and_publish_prize_pool(room_ref)
+        _sweep_unpaid_reservations(room_ref)
 
         while True:
             loop_start = time.time()
