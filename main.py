@@ -1445,7 +1445,6 @@ def _daily_report_scheduler(loop):
 # ============================================================
 ROUND_CARD_SELECTION_SECONDS = 45  # must match CARD_SELECTION_SECONDS in index.html
 ROUND_CALL_INTERVAL_SECONDS = 3    # must match the 3000ms cadence in index.html
-PAID_SETTLE_MAX_SECONDS = 8        # max time to wait, after the deadline, for every reserved card's stake deduction to actually land before computing the prize pool
 
 # Play 10 and Play 20 are separate games -- separate round, card selection,
 # caller and prize pool -- each living under its own "room_<stake>" path
@@ -1454,20 +1453,12 @@ GAME_STAKES = [10, 20]
 
 
 def _compute_and_publish_prize_pool(room_ref):
-    """Reads room/takenCards, computes 80% of total stake for cards whose
-    deduction actually committed (paid=true), and writes room/prizePool if
-    it hasn't already been set for this round. Only counting paid cards
-    matters because a card can still be sitting in takenCards as a bare
-    reservation (deduction hasn't run yet) or get released moments after
-    a failed deduction (see releaseSelectedCardsAndSpectate() in
-    index.html) -- neither of those should count toward the pool, and
-    checking paid=true is immune to exactly when that release lands
-    relative to this read, unlike counting takenCards directly would be."""
+    """Reads room/takenCards, computes 80% of total stake, writes
+    room/prizePool if it hasn't already been set for this round --
+    mirrors the old client-side acquireRoundCaller() logic exactly."""
     taken = room_ref.child("takenCards").get() or {}
     pool_base = 0.0
     for card in taken.values():
-        if not (card or {}).get("paid"):
-            continue
         try:
             pool_base += float((card or {}).get("stake", 0) or 0)
         except (TypeError, ValueError):
@@ -1522,23 +1513,10 @@ def _call_next_number(room_ref):
         room_ref.child("lastCallAt").set({".sv": "timestamp"})
 
 
-def _normalize_matrix_row(row):
-    """Firebase can return a nested array as a dict with string-number keys
-    instead of a plain list in some read paths. Normalize back to an
-    ordered list of 5 values so index access below never breaks."""
-    if isinstance(row, dict):
-        return [row.get(str(i)) for i in range(5)]
-    return row
-
-
 def _matrix_has_win(matrix, called_set):
     """Same five win patterns as index.html's getWinningPattern(): any full
     row, any full column, either diagonal, or all four corners -- with
     'FREE' always counting as already-marked."""
-    if isinstance(matrix, dict):
-        matrix = [matrix.get(str(i)) for i in range(5)]
-    matrix = [_normalize_matrix_row(row) for row in matrix]
-
     def hit(v):
         return v == "FREE" or v in called_set
 
@@ -1560,12 +1538,12 @@ def _matrix_has_win(matrix, called_set):
 
 def _check_and_finalize_winners(room_ref):
     """Independently checks every taken card against the numbers called so
-    far and, if any card has a live win, finalizes the round (winnerCards +
-    roundEnded). Re-checks roundEnded right before writing (instead of a
-    transaction lock whose abort semantics differ between the JS and Python
-    Admin SDKs) -- a client's own finalizeRoundWinners() racing this is
-    rare and harmless even if both write once. Returns True if this call
-    finalized the round."""
+    far and, if any card has a live win, atomically finalizes the round
+    (winnerCards + roundEnded) -- using the exact same room/roundFinalizing
+    transaction lock the client's finalizeRoundWinners() uses, so whichever
+    side (this server thread or a player's browser) gets there first simply
+    wins the race safely; the other's attempt is a harmless no-op. Returns
+    True if this call finalized the round."""
     taken = room_ref.child("takenCards").get() or {}
     if not taken:
         return False
@@ -1584,36 +1562,22 @@ def _check_and_finalize_winners(room_ref):
                     "by": card.get("by"),
                     "name": card.get("name"),
                 }
-        except Exception:
-            log.exception(f"Win check failed for card {card_num_str}")
+        except Exception as e:
+            log.warning(f"Win check failed for card {card_num_str}: {e}")
 
     if not winners:
         return False
 
-    if room_ref.child("roundEnded").get() is True:
-        return False  # already ended (e.g. by a client) between the reads above
+    lock = room_ref.child("roundFinalizing").transaction(
+        lambda current: True if current is not True else current
+    )
+    if not lock:
+        return False  # a client (or this check on a re-run) already won the lock
 
     room_ref.child("winnerCards").set(winners)
     room_ref.child("roundEnded").set(True)
     log.info(f"Server-side winner check finalized round with {len(winners)} winner(s).")
     return True
-
-
-def _sweep_unpaid_reservations(room_ref):
-    """Removes any takenCards entries that never got marked paid=true by
-    the time the round moved past selection -- e.g. a player whose screen
-    locked/app was backgrounded (dropping the Firebase connection, but not
-    a real departure) mid-selection, or someone who genuinely closed the
-    app and never came back. These reservations are no longer released the
-    instant the connection drops (that was releasing cards for players who
-    were still actually playing, just with the screen off for a moment) --
-    this sweep is the replacement cleanup, run once the prize pool has
-    already been computed from paid cards only, so it can never affect the
-    payout even for a reservation that pays a beat too late."""
-    taken = room_ref.child("takenCards").get() or {}
-    for card_num_str, card in taken.items():
-        if not (card or {}).get("paid"):
-            room_ref.child("takenCards").child(card_num_str).delete()
 
 
 def _run_one_round(room_ref, round_id):
@@ -1633,27 +1597,12 @@ def _run_one_round(room_ref, round_id):
         now_ms = _firebase_now_ms(room_ref)
         remaining_s = (deadline_ms - now_ms) / 1000.0
         if remaining_s > 0:
-            time.sleep(remaining_s)
+            time.sleep(remaining_s + 0.5)  # small buffer past the client deadline
 
         if room_ref.child("roundEnded").get() is True:
             return  # round already wrapped up (e.g. no cards were taken)
 
-        # Wait for every reservation to actually settle (paid=true, once the
-        # client's stake deduction commits, or removed if it failed) before
-        # computing the prize pool -- polling instead of a fixed guess at
-        # how long that takes, since a slow connection can easily take
-        # longer than any fixed buffer, and a fixed buffer that's too short
-        # was leaving the pool permanently stuck undercounting a card that
-        # genuinely did get paid for, just a beat too late.
-        settle_deadline = time.time() + PAID_SETTLE_MAX_SECONDS
-        while time.time() < settle_deadline:
-            taken = room_ref.child("takenCards").get() or {}
-            if not taken or all((c or {}).get("paid") for c in taken.values()):
-                break
-            time.sleep(0.5)
-
         _compute_and_publish_prize_pool(room_ref)
-        _sweep_unpaid_reservations(room_ref)
 
         while True:
             loop_start = time.time()
