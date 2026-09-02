@@ -14,6 +14,8 @@ import random
 import re
 import threading
 import time
+import urllib.request
+import urllib.error
 from datetime import datetime, timedelta
 from typing import Optional, Tuple, Dict, Any
 from urllib.parse import parse_qsl
@@ -178,6 +180,7 @@ def _refund_withdrawal(user_id: str, amount: float) -> Tuple[bool, Optional[str]
 # restart/redeploy on Render instead of silently resetting to zero.
 DEPOSIT_RATE_LIMIT_MAX = 5
 DEPOSIT_RATE_LIMIT_WINDOW = 600
+AUTO_APPROVE_MAX_AMOUNT = 2000
 
 
 def _deposit_rate_limited(user_id: str) -> bool:
@@ -310,6 +313,99 @@ def parse_telebirr_sms_improved(text: str) -> Optional[Dict[str, Any]]:
         "recipient_name": name_match.group(1).strip() if name_match else "",
         "raw_text": text,
     }
+
+
+def fetch_telebirr_receipt_improved(receipt_no: str) -> Optional[Dict[str, Any]]:
+    url = f"https://transactioninfo.ethiotelecom.et/receipt/{receipt_no}"
+    
+    user_agents = [
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    ]
+    
+    for ua in user_agents:
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": ua})
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                html = resp.read().decode("utf-8", errors="ignore")
+                break
+        except Exception as e:
+            log.warning(f"User-Agent {ua[:30]}... failed: {e}")
+            continue
+    else:
+        log.warning(f"All User-Agents failed for {receipt_no}")
+        return None
+    
+    result = {"amount": None, "all_phones": [], "date_text": None, "status": "unknown"}
+    
+    amount_patterns = [
+        r'([\d,]+(?:\.\d+)?)\s*(?:ETB|Birr|ብር)',
+        r'Amount[:\s]*([\d,]+(?:\.\d+)?)',
+        r'ብር[:\s]*([\d,]+(?:\.\d+)?)',
+        r'([\d,]+(?:\.\d+)?)\s*ETB',
+    ]
+    
+    for pattern in amount_patterns:
+        match = re.search(pattern, html, re.IGNORECASE)
+        if match:
+            try:
+                result["amount"] = float(match.group(1).replace(",", ""))
+                break
+            except ValueError:
+                continue
+    
+    phone_patterns = [
+        r'(?:251)?0?9\d{8}',
+        r'\+\d{1,3}0?9\d{8}',
+    ]
+    all_phones = []
+    for pattern in phone_patterns:
+        phones = re.findall(pattern, html)
+        all_phones.extend(phones)
+    result["all_phones"] = list(set(all_phones))
+    
+    date_patterns = [
+        r'(\d{1,2}[/-]\d{1,2}[/-]\d{4}[,\s]+\d{1,2}:\d{2}(?::\d{2})?)',
+        r'(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})',
+        r'(\d{1,2}/\d{1,2}/\d{4}\s+\d{1,2}:\d{2})',
+    ]
+    for pattern in date_patterns:
+        match = re.search(pattern, html)
+        if match:
+            result["date_text"] = match.group(1)
+            break
+    
+    if "successful" in html.lower() or "completed" in html.lower() or "confirmed" in html.lower():
+        result["status"] = "success"
+    elif "failed" in html.lower() or "rejected" in html.lower():
+        result["status"] = "failed"
+    else:
+        result["status"] = "unknown"
+    
+    if result["amount"] is None:
+        log.warning(f"Could not extract amount from receipt page for {receipt_no}")
+        return None
+    
+    return result
+
+
+def fetch_telebirr_receipt_with_retry_improved(
+    receipt_no: str, max_wait_seconds: int = 120, poll_interval: int = 5
+) -> Optional[Dict[str, Any]]:
+    deadline = time.time() + max_wait_seconds
+    attempt = 0
+    while True:
+        attempt += 1
+        log.info(f"Fetching receipt {receipt_no} attempt {attempt}")
+        receipt = fetch_telebirr_receipt_improved(receipt_no)
+        if receipt is not None:
+            log.info(f"Receipt {receipt_no} found on attempt {attempt}")
+            return receipt
+        if time.time() >= deadline:
+            log.info(f"Giving up on receipt {receipt_no} after {attempt} attempts")
+            return None
+        time.sleep(poll_interval)
 
 
 # ============================================================
@@ -487,7 +583,68 @@ def webapp_auth():
         resp.status_code = 500
         return _cors(resp)
 
+    # Make sure this user's wallet exists BEFORE they ever sign in with
+    # this token. The Mini App used to create it itself, client-side, the
+    # first time it saw no wallet there yet -- but the tightened Firebase
+    # rules that go with this fix only allow a client to ever DECREASE
+    # wallet.main/play/deposited, never set them from scratch, precisely
+    # to close off a client being able to write itself an arbitrary
+    # starting balance. Guaranteeing the wallet already exists here keeps
+    # that client-side fallback from ever actually needing to fire for a
+    # real user.
+    _get_wallet_safe(user_id)
+
     return _cors(jsonify({"token": token_str, "userId": user_id}))
+
+
+@flask_app.route("/claim-registration-bonus", methods=["POST", "OPTIONS"])
+def claim_registration_bonus():
+    """Grants the one-time registration bonus. This used to be a client-
+    side applyWalletDelta(0, 10, 0) call in index.html, gated only by an
+    in-memory JS flag and a localStorage key -- both trivially cleared or
+    bypassed, and neither stopped anyone from just calling that same
+    Firebase write themselves, repeatedly, for unlimited free play
+    balance. Verifying initData here (same as /webapp-auth) proves who's
+    asking, and reserving the registered flag the same way
+    deposit_payment_handler reserves a receipt number above -- a single
+    atomic transaction, checked via a closure flag -- makes the grant
+    itself race-proof and one-time no matter how many times or how fast
+    this is called for the same user."""
+    if request.method == "OPTIONS":
+        return _cors(flask_app.make_default_options_response())
+
+    body = request.get_json(silent=True) or {}
+    user_id = _verify_telegram_init_data(body.get("initData", ""))
+    if not user_id:
+        resp = jsonify({"error": "invalid or expired initData"})
+        resp.status_code = 401
+        return _cors(resp)
+
+    BONUS_AMOUNT = 10
+    already_registered_holder = {"already_registered": False}
+
+    def reserve(current):
+        if current is True:
+            already_registered_holder["already_registered"] = True
+            return current  # no-op — already granted, leave as-is
+        return True
+
+    registered_ref = db.reference(f"users/{user_id}/registered")
+    registered_ref.transaction(reserve)
+
+    if already_registered_holder["already_registered"]:
+        return _cors(jsonify({"granted": False, "reason": "already registered"}))
+
+    success, err = _update_wallet(user_id, play_delta=BONUS_AMOUNT)
+    if not success:
+        # Credit failed -- release the reservation so a retry can still
+        # claim the bonus instead of being locked out of it forever.
+        registered_ref.set(False)
+        resp = jsonify({"error": err or "credit failed"})
+        resp.status_code = 500
+        return _cors(resp)
+
+    return _cors(jsonify({"granted": True, "amount": BONUS_AMOUNT}))
 
 
 def run_web_server():
@@ -1513,79 +1670,164 @@ def _call_next_number(room_ref):
         room_ref.child("lastCallAt").set({".sv": "timestamp"})
 
 
-def _matrix_has_win(matrix, called_set):
-    """Same five win patterns as index.html's getWinningPattern(): any full
-    row, any full column, either diagonal, or all four corners -- with
-    'FREE' always counting as already-marked."""
+def _card_has_win(matrix, called_set):
+    """Returns the winning pattern (list of [row, col] pairs) for this
+    card's matrix given the numbers called so far, or None if it hasn't
+    won yet. Mirrors getWinningPattern()/checkGlobalWinConditions() in
+    index.html exactly -- row, column, either diagonal, or four corners --
+    so this credits a card if and only if the UI would show it as a
+    winner, just checked here against data no player's own device can
+    edit, instead of trusting whatever a browser claims."""
     def hit(v):
         return v == "FREE" or v in called_set
 
-    for row in matrix:
-        if all(hit(v) for v in row):
-            return True
+    for r in range(5):
+        if all(hit(matrix[r][c]) for c in range(5)):
+            return [[r, c] for c in range(5)]
     for c in range(5):
         if all(hit(matrix[r][c]) for r in range(5)):
-            return True
+            return [[r, c] for r in range(5)]
     if all(hit(matrix[i][i]) for i in range(5)):
-        return True
+        return [[i, i] for i in range(5)]
     if all(hit(matrix[i][4 - i]) for i in range(5)):
-        return True
-    corners = [matrix[0][0], matrix[0][4], matrix[4][0], matrix[4][4]]
-    if all(hit(v) for v in corners):
-        return True
-    return False
+        return [[i, 4 - i] for i in range(5)]
+    corners = [(0, 0), (0, 4), (4, 0), (4, 4)]
+    if all(hit(matrix[r][c]) for r, c in corners):
+        return [[r, c] for r, c in corners]
+    return None
 
 
-def _check_and_finalize_winners(room_ref):
-    """Independently checks every taken card against the numbers called so
-    far and, if any card has a live win, atomically finalizes the round
-    (winnerCards + roundEnded) -- using the exact same room/roundFinalizing
-    transaction lock the client's finalizeRoundWinners() uses, so whichever
-    side (this server thread or a player's browser) gets there first simply
-    wins the race safely; the other's attempt is a harmless no-op. Returns
-    True if this call finalized the round."""
+def _check_all_cards_for_win(room_ref, called_set):
+    """Reads every claimed card straight from room/takenCards (the same
+    place claimCardInFirebase() writes each card's real matrix to) and
+    independently re-checks each one against the numbers actually called
+    so far. This -- not anything a browser reports -- is what now decides
+    who has won."""
     taken = room_ref.child("takenCards").get() or {}
-    if not taken:
-        return False
-    called_set = set(room_ref.child("calledNumbers").get() or [])
-    if not called_set:
-        return False
-
-    winners = {}
-    for card_num_str, card in taken.items():
-        matrix = (card or {}).get("matrix")
+    winners = []
+    for card_num_str, entry in taken.items():
+        if not isinstance(entry, dict):
+            continue
+        matrix = entry.get("matrix")
         if not matrix:
             continue
-        try:
-            if _matrix_has_win(matrix, called_set):
-                winners[card_num_str] = {
-                    "by": card.get("by"),
-                    "name": card.get("name"),
-                }
-        except Exception as e:
-            log.warning(f"Win check failed for card {card_num_str}: {e}")
-
-    if not winners:
-        return False
-
-    lock = room_ref.child("roundFinalizing").transaction(
-        lambda current: True if current is not True else current
-    )
-    if not lock:
-        return False  # a client (or this check on a re-run) already won the lock
-
-    room_ref.child("winnerCards").set(winners)
-    room_ref.child("roundEnded").set(True)
-    log.info(f"Server-side winner check finalized round with {len(winners)} winner(s).")
-    return True
+        pattern = _card_has_win(matrix, called_set)
+        if pattern:
+            winners.append({
+                "cardNum": int(card_num_str),
+                "by": entry.get("by"),
+                "name": entry.get("name"),
+                "pattern": pattern,
+            })
+    return winners
 
 
-def _run_one_round(room_ref, round_id):
-    """Blocks the calling thread for the lifetime of one round: waits out
-    the shared card-selection window, publishes the prize pool once, then
-    calls numbers every few seconds until 75 numbers are out or a winner
-    ends the round (roundEnded, set client-side as before)."""
+def _credit_bingo_payout(user_id, payout_key, amount, num_winners):
+    """Idempotently pays a bingo win straight into wallet.main inside one
+    Firebase Admin SDK transaction. Previously index.html's own browser
+    code did this exact write directly from the client -- meaning anyone
+    with devtools/the Firebase JS SDK could call that same transaction
+    themselves and credit their own wallet an arbitrary amount without
+    ever winning a round. Now that this bot (using the Admin SDK, which
+    the security rules can restrict to server-only) is the only thing
+    that ever increases wallet.main for a game win, and only ever does so
+    after _card_has_win() above independently confirmed a real win, that
+    path is closed. bingoPayouts[payout_key] keeps this idempotent -- a
+    restart or a re-run of the same round can never pay the same user
+    twice for it."""
+    if not user_id or amount <= 0:
+        return
+    wallet_ref = _wallet_ref(str(user_id))
+
+    def txn(current):
+        if current is None:
+            current = {"main": 0, "play": 0, "deposited": 0}
+        current = dict(current)
+        payouts = dict(current.get("bingoPayouts") or {})
+        if payout_key in payouts:
+            return current  # already paid out for this round -- no-op
+        current["main"] = current.get("main", 0) + amount
+        payouts[payout_key] = {
+            "amount": amount,
+            "winners": num_winners,
+            "ts": int(time.time() * 1000),
+        }
+        current["bingoPayouts"] = payouts
+        return current
+
     try:
+        wallet_ref.transaction(txn)
+    except Exception as e:
+        log.error(f"Bingo payout credit failed for {user_id}: {e}")
+
+
+def _finalize_round_and_payout(room_ref, stake, round_id, winners):
+    """The single place that ends a round and pays its winners, now that
+    winner detection lives here instead of in every player's browser.
+    Only ever called from _run_one_round's own loop, which
+    _round_watcher_loop already runs at most once at a time per stake --
+    so there's no other caller to race against, unlike the old client-side
+    finalizeRoundWinners() which needed its own cross-device lock."""
+    updates = {}
+    for w in winners:
+        updates[str(w["cardNum"])] = {
+            "by": w.get("by"),
+            "name": w.get("name"),
+            "pattern": w.get("pattern") or [],
+        }
+    room_ref.child("winnerCards").set(updates)
+
+    prize_pool = float(room_ref.child("prizePool").get() or 0)
+    sorted_winners = sorted(winners, key=lambda w: w["cardNum"])
+    num_winners = len(sorted_winners)
+    prize_cents = round(prize_pool * 100)
+    base_cents = prize_cents // num_winners if num_winners else 0
+    remainder_cents = prize_cents - base_cents * num_winners if num_winners else 0
+
+    payout_key = f"{stake}_{round_id}"
+    for idx, w in enumerate(sorted_winners):
+        share_cents = base_cents + (1 if idx < remainder_cents else 0)
+        _credit_bingo_payout(w.get("by"), payout_key, share_cents / 100.0, num_winners)
+
+    # Set last so every listening client's roundEnded flip only ever fires
+    # after winnerCards is written AND every winner's wallet is already
+    # credited -- the popup/history read in subscribeRoundEnd() never has
+    # to wait for or race the payout.
+    room_ref.child("roundEnded").set(True)
+
+
+def _run_one_round(room_ref, round_id, stake):
+    """Blocks the calling thread for the lifetime of one round: clears out
+    the previous round's leftover state, waits out the shared
+    card-selection window, publishes the prize pool once, then calls
+    numbers every few seconds -- checking after each one whether any card
+    has actually won -- until either a real winner is found and paid
+    (_finalize_round_and_payout) or all 75 numbers are out with no
+    winner."""
+    try:
+        # Clear out everything left over from the previous round in this
+        # room. This used to be done client-side, by whichever player's
+        # device happened to win the "start the round" race -- including
+        # calledNumbers/winnerCards/roundEnded/prizePool, which only the
+        # bot is now allowed to write at all (see the Firebase rules that
+        # go with this file). Left undone, a stale roundEnded: true from
+        # the last round would make this new round look already finished
+        # the instant it starts. takenCards/userCardCount/caller are
+        # included here too so no per-round state is split between two
+        # writers -- the bot alone owns every one of these for a round's
+        # entire lifecycle now.
+        room_ref.update({
+            "takenCards": None,
+            "userCardCount": None,
+            "caller": None,
+            "calledNumbers": None,
+            "winnerCards": None,
+            "roundEnded": None,
+            "prizePool": None,
+            "lastCallAt": None,
+            "roundFinalizing": None,
+        })
+
         # Prefer the exact deadline clients are already counting down to
         # (written once, in Firebase server time, by whoever's device
         # started the round) over recomputing it from round_id -- and
@@ -1609,14 +1851,27 @@ def _run_one_round(room_ref, round_id):
             if room_ref.child("roundEnded").get() is True:
                 return
             called = room_ref.child("calledNumbers").get() or []
+            called_set = set(called)
+
+            # Server-authoritative win check: every claimed card is
+            # re-verified here against the numbers actually written to
+            # Firebase, independent of anything any player's device
+            # reports. See _check_all_cards_for_win/_card_has_win.
+            winners = _check_all_cards_for_win(room_ref, called_set)
+            if winners:
+                _finalize_round_and_payout(room_ref, stake, round_id, winners)
+                return
+
             if len(called) >= 75:
+                # All 75 numbers are out and no card ever won -- close the
+                # round out explicitly instead of just returning, so every
+                # listening client's roundEnded/winnerCards listener fires
+                # and resets them (otherwise the room stays stuck showing
+                # the finished round -- stale Derash/Called -- forever).
+                room_ref.child("winnerCards").set({})
+                room_ref.child("roundEnded").set(True)
                 return
             _call_next_number(room_ref)
-            # Check independently, right after the new number lands, whether
-            # any taken card now has a live win -- don't rely solely on a
-            # player's own browser to report it.
-            if _check_and_finalize_winners(room_ref):
-                return
             # Each Firebase read/transaction above takes real network time
             # (often a few hundred ms, sometimes more under load). Sleeping
             # a full ROUND_CALL_INTERVAL_SECONDS on top of that -- instead of
@@ -1646,12 +1901,12 @@ def _round_watcher_loop(stake):
                     last_handled_round_id = round_id
                     round_calling = True
                     try:
-                        _run_one_round(room_ref, round_id)
+                        _run_one_round(room_ref, round_id, stake)
                     finally:
                         round_calling = False
         except Exception as e:
             log.error(f"Round watcher loop error (stake {stake}): {e}")
-        time.sleep(1)
+        time.sleep(0.3)
 
 
 # ============================================================
