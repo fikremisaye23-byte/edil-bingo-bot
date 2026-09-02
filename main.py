@@ -1796,6 +1796,44 @@ def _finalize_round_and_payout(room_ref, stake, round_id, winners):
     room_ref.child("roundEnded").set(True)
 
 
+def _claim_round_for_calling(room_ref, round_id) -> bool:
+    """Cross-process lock: atomically claims round_id for number-calling
+    via a Firebase transaction, so only ONE bot process ever actually
+    runs _run_one_round for it -- even if more than one instance of this
+    bot is alive at once (e.g. a stale process left running during a
+    Render redeploy overlap, the exact scenario behind the
+    "Conflict: terminated by other getUpdates request" errors).
+
+    Without this, _round_watcher_loop's last_handled_round_id/round_calling
+    flags are per-PROCESS only -- invisible to any other instance. A second
+    process would see the same round_id as "new to me" and call
+    _run_one_round itself, whose very first action wipes
+    calledNumbers/winnerCards/roundEnded back to None. If that happens right
+    after the real instance already found a winner and set those fields,
+    the just-announced win is erased before players ever see it -- the
+    round just silently resets instead. Keying the lock off round_id itself
+    (rather than clearing it between rounds) means it only ever blocks a
+    duplicate attempt at the SAME round; the next real round_id is a
+    different value and claims cleanly."""
+    claim_ref = room_ref.child("callerClaimedRoundId")
+    abort_holder = {"already_claimed": False}
+
+    def claim(current):
+        if current == round_id:
+            abort_holder["already_claimed"] = True
+            return current  # no-op -- another process already owns this round
+        return round_id
+
+    try:
+        result = claim_ref.transaction(claim)
+        if result is None:
+            return False
+        return not abort_holder["already_claimed"]
+    except Exception as e:
+        log.error(f"Round-claim transaction failed for round {round_id} (stake?): {e}")
+        return False
+
+
 def _run_one_round(room_ref, round_id, stake):
     """Blocks the calling thread for the lifetime of one round: clears out
     the previous round's leftover state, waits out the shared
@@ -1899,11 +1937,18 @@ def _round_watcher_loop(stake):
                 round_id = room_ref.child("roundId").get()
                 if round_id and round_id != last_handled_round_id:
                     last_handled_round_id = round_id
-                    round_calling = True
-                    try:
-                        _run_one_round(room_ref, round_id, stake)
-                    finally:
-                        round_calling = False
+                    if _claim_round_for_calling(room_ref, round_id):
+                        round_calling = True
+                        try:
+                            _run_one_round(room_ref, round_id, stake)
+                        finally:
+                            round_calling = False
+                    else:
+                        log.info(
+                            f"Round {round_id} (stake {stake}) is already claimed by "
+                            "another running instance -- skipping to avoid double-calling "
+                            "or wiping its result."
+                        )
         except Exception as e:
             log.error(f"Round watcher loop error (stake {stake}): {e}")
         time.sleep(0.3)
