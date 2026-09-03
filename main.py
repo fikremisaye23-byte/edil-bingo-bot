@@ -1864,6 +1864,14 @@ def _run_one_round(room_ref, round_id, stake):
             "prizePool": None,
             "lastCallAt": None,
             "roundFinalizing": None,
+            # Written in this SAME multi-path update (atomic on Firebase's
+            # side) so no client can ever observe the wipe as "done" before
+            # it actually is. Clients wait for this to equal round_id before
+            # writing their own card claims -- see claimCardInFirebase in
+            # index.html -- closing the race where a fast tap right as the
+            # round starts could land just before this wipe and be silently
+            # erased by it a moment later.
+            "roundReady": round_id,
         })
 
         # Prefer the exact deadline clients are already counting down to
