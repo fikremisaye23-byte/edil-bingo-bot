@@ -1580,6 +1580,26 @@ def _check_and_finalize_winners(room_ref):
     return True
 
 
+def _finalize_no_winner(room_ref):
+    """Called once all 75 numbers have been called and no taken card ever
+    matched a winning pattern. Uses the same roundFinalizing lock as
+    _check_and_finalize_winners, so if a winner is somehow found in the
+    same instant (e.g. a client-side check racing this one) that finalize
+    wins and this becomes a harmless no-op. Sets roundEnded with no
+    winnerCards, which every connected client's roundEnded listener picks
+    up immediately -- instead of each client only discovering the round is
+    dead later via its own staleness timeout -- so both the 10-birr and
+    20-birr rooms return their players to card selection the same way."""
+    lock = room_ref.child("roundFinalizing").transaction(
+        lambda current: True if current is not True else current
+    )
+    if not lock:
+        return False  # a winner was already finalized for this round
+    room_ref.child("roundEnded").set(True)
+    log.info("Round ended with no winner after 75 calls.")
+    return True
+
+
 def _run_one_round(room_ref, round_id):
     """Blocks the calling thread for the lifetime of one round: waits out
     the shared card-selection window, publishes the prize pool once, then
@@ -1610,6 +1630,7 @@ def _run_one_round(room_ref, round_id):
                 return
             called = room_ref.child("calledNumbers").get() or []
             if len(called) >= 75:
+                _finalize_no_winner(room_ref)
                 return
             _call_next_number(room_ref)
             # Check independently, right after the new number lands, whether
