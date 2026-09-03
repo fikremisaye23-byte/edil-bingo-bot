@@ -1796,6 +1796,9 @@ def _finalize_round_and_payout(room_ref, stake, round_id, winners):
     room_ref.child("roundEnded").set(True)
 
 
+ROUND_CLAIM_STALE_MS = 90_000  # generous vs the 45s selection window + 3s call cadence
+
+
 def _claim_round_for_calling(room_ref, round_id) -> bool:
     """Cross-process lock: atomically claims round_id for number-calling
     via a Firebase transaction, so only ONE bot process ever actually
@@ -1811,18 +1814,32 @@ def _claim_round_for_calling(room_ref, round_id) -> bool:
     calledNumbers/winnerCards/roundEnded back to None. If that happens right
     after the real instance already found a winner and set those fields,
     the just-announced win is erased before players ever see it -- the
-    round just silently resets instead. Keying the lock off round_id itself
-    (rather than clearing it between rounds) means it only ever blocks a
-    duplicate attempt at the SAME round; the next real round_id is a
-    different value and claims cleanly."""
+    round just silently resets instead.
+
+    The claim carries a heartbeat timestamp, refreshed periodically by
+    whichever process actually holds it (see _refresh_round_claim, called
+    from inside _run_one_round's wait and calling loops). Without that
+    heartbeat, a claim from a process that died mid-round -- e.g. a Render
+    redeploy killing the old instance while a round was still in progress --
+    would stay marked "claimed" forever, since round_id itself never
+    changes until *someone* finishes calling that round. No live process
+    could then ever pick it back up, freezing that room's caller
+    permanently. Treating a heartbeat older than ROUND_CLAIM_STALE_MS as
+    abandoned, and letting a fresh process reclaim it, is what actually
+    recovers from that."""
     claim_ref = room_ref.child("callerClaimedRoundId")
+    now_ms = _firebase_now_ms(room_ref)
     abort_holder = {"already_claimed": False}
 
     def claim(current):
-        if current == round_id:
-            abort_holder["already_claimed"] = True
-            return current  # no-op -- another process already owns this round
-        return round_id
+        if isinstance(current, dict) and current.get("round_id") == round_id:
+            heartbeat = current.get("heartbeat") or 0
+            if (now_ms - heartbeat) < ROUND_CLAIM_STALE_MS:
+                abort_holder["already_claimed"] = True
+                return current  # no-op -- another process is actively holding this round
+            # Heartbeat is stale -- the previous owner is presumed dead
+            # (e.g. killed by a redeploy). Fall through and reclaim it.
+        return {"round_id": round_id, "heartbeat": now_ms}
 
     try:
         result = claim_ref.transaction(claim)
@@ -1830,8 +1847,22 @@ def _claim_round_for_calling(room_ref, round_id) -> bool:
             return False
         return not abort_holder["already_claimed"]
     except Exception as e:
-        log.error(f"Round-claim transaction failed for round {round_id} (stake?): {e}")
+        log.error(f"Round-claim transaction failed for round {round_id}: {e}")
         return False
+
+
+def _refresh_round_claim(room_ref, round_id):
+    """Keeps this process's claim on round_id alive by refreshing its
+    heartbeat. Called periodically from _run_one_round for as long as it's
+    actually still running the round, so a legitimately long-running round
+    (the 45s selection wait plus however long calling takes) is never
+    mistaken for an abandoned one by _claim_round_for_calling."""
+    try:
+        room_ref.child("callerClaimedRoundId").set(
+            {"round_id": round_id, "heartbeat": _firebase_now_ms(room_ref)}
+        )
+    except Exception as e:
+        log.error(f"Failed to refresh round claim heartbeat for round {round_id}: {e}")
 
 
 def _run_one_round(room_ref, round_id, stake):
@@ -1884,8 +1915,17 @@ def _run_one_round(room_ref, round_id, stake):
             deadline_ms = round_id + ROUND_CARD_SELECTION_SECONDS * 1000
         now_ms = _firebase_now_ms(room_ref)
         remaining_s = (deadline_ms - now_ms) / 1000.0
-        if remaining_s > 0:
-            time.sleep(remaining_s + 0.5)  # small buffer past the client deadline
+        # Sleep in chunks (instead of one long sleep) so the claim's
+        # heartbeat gets refreshed periodically even during this wait --
+        # otherwise a round with, say, a longer-than-usual selection window
+        # could have its own still-valid claim mistaken for abandoned by
+        # _claim_round_for_calling before calling even starts.
+        while remaining_s > 0:
+            chunk = min(remaining_s, 20.0)
+            time.sleep(chunk)
+            remaining_s -= chunk
+            _refresh_round_claim(room_ref, round_id)
+        time.sleep(0.5)  # small buffer past the client deadline
 
         if room_ref.child("roundEnded").get() is True:
             return  # round already wrapped up (e.g. no cards were taken)
@@ -1918,6 +1958,7 @@ def _run_one_round(room_ref, round_id, stake):
                 room_ref.child("roundEnded").set(True)
                 return
             _call_next_number(room_ref)
+            _refresh_round_claim(room_ref, round_id)
             # Each Firebase read/transaction above takes real network time
             # (often a few hundred ms, sometimes more under load). Sleeping
             # a full ROUND_CALL_INTERVAL_SECONDS on top of that -- instead of
