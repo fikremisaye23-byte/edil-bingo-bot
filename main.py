@@ -583,68 +583,7 @@ def webapp_auth():
         resp.status_code = 500
         return _cors(resp)
 
-    # Make sure this user's wallet exists BEFORE they ever sign in with
-    # this token. The Mini App used to create it itself, client-side, the
-    # first time it saw no wallet there yet -- but the tightened Firebase
-    # rules that go with this fix only allow a client to ever DECREASE
-    # wallet.main/play/deposited, never set them from scratch, precisely
-    # to close off a client being able to write itself an arbitrary
-    # starting balance. Guaranteeing the wallet already exists here keeps
-    # that client-side fallback from ever actually needing to fire for a
-    # real user.
-    _get_wallet_safe(user_id)
-
     return _cors(jsonify({"token": token_str, "userId": user_id}))
-
-
-@flask_app.route("/claim-registration-bonus", methods=["POST", "OPTIONS"])
-def claim_registration_bonus():
-    """Grants the one-time registration bonus. This used to be a client-
-    side applyWalletDelta(0, 10, 0) call in index.html, gated only by an
-    in-memory JS flag and a localStorage key -- both trivially cleared or
-    bypassed, and neither stopped anyone from just calling that same
-    Firebase write themselves, repeatedly, for unlimited free play
-    balance. Verifying initData here (same as /webapp-auth) proves who's
-    asking, and reserving the registered flag the same way
-    deposit_payment_handler reserves a receipt number above -- a single
-    atomic transaction, checked via a closure flag -- makes the grant
-    itself race-proof and one-time no matter how many times or how fast
-    this is called for the same user."""
-    if request.method == "OPTIONS":
-        return _cors(flask_app.make_default_options_response())
-
-    body = request.get_json(silent=True) or {}
-    user_id = _verify_telegram_init_data(body.get("initData", ""))
-    if not user_id:
-        resp = jsonify({"error": "invalid or expired initData"})
-        resp.status_code = 401
-        return _cors(resp)
-
-    BONUS_AMOUNT = 10
-    already_registered_holder = {"already_registered": False}
-
-    def reserve(current):
-        if current is True:
-            already_registered_holder["already_registered"] = True
-            return current  # no-op — already granted, leave as-is
-        return True
-
-    registered_ref = db.reference(f"users/{user_id}/registered")
-    registered_ref.transaction(reserve)
-
-    if already_registered_holder["already_registered"]:
-        return _cors(jsonify({"granted": False, "reason": "already registered"}))
-
-    success, err = _update_wallet(user_id, play_delta=BONUS_AMOUNT)
-    if not success:
-        # Credit failed -- release the reservation so a retry can still
-        # claim the bonus instead of being locked out of it forever.
-        registered_ref.set(False)
-        resp = jsonify({"error": err or "credit failed"})
-        resp.status_code = 500
-        return _cors(resp)
-
-    return _cors(jsonify({"granted": True, "amount": BONUS_AMOUNT}))
 
 
 def run_web_server():
@@ -828,32 +767,13 @@ async def _finalize_deposit_approval(context, query, record: Dict[str, Any], key
     """Credits the wallet, records the approved deposit, and notifies both
     the admin and the user. Shared by the normal 'approve' path and the
     'approveforce' path (used after an amount-mismatch warning) so the
-    crediting logic only exists once.
-
-    Guarded by a Firebase transaction that atomically flips status from
-    "pending" to "processing" before any money moves -- a double-tap on the
-    Approve button, or Telegram redelivering the same callback (which does
-    happen on flaky connections), would otherwise both pass the earlier
-    plain "if status == pending" check and credit the wallet twice."""
+    crediting logic only exists once."""
     amount = record.get("amount", 0)
     user_id = record.get("by")
     name = record.get("name", "Player")
 
-    record_ref = pending_deposits_ref.child(key)
-    claim = record_ref.transaction(
-        lambda current: {**current, "status": "processing"}
-        if current and current.get("status") == "pending"
-        else current
-    )
-    if not claim or claim.get("status") != "processing":
-        await query.edit_message_text("ℹ️ Already handled (double tap or duplicate action ignored).")
-        return
-
     success, err = _credit_deposit_wallet(user_id, amount)
     if not success:
-        # Roll the claim back to pending so a retry (or the admin approving
-        # again) is still possible after a transient wallet-write failure.
-        record_ref.update({"status": "pending"})
         await query.edit_message_text(f"❌ Failed to credit wallet: {err}")
         return
 
@@ -943,16 +863,12 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _finalize_deposit_approval(context, query, record, key)
 
         else:
-            record_ref = pending_deposits_ref.child(key)
-            claimed = record_ref.transaction(
-                lambda current: {**current, "status": "rejected", "rejected_at": datetime.now().isoformat(), "rejected_by": "admin"}
-                if current and current.get("status") == "pending"
-                else current
-            )
-            if not claimed or claimed.get("status") != "rejected":
-                await query.edit_message_text("ℹ️ Already handled (double tap or duplicate action ignored).")
-                return
-
+            pending_deposits_ref.child(key).update({
+                "status": "rejected",
+                "rejected_at": datetime.now().isoformat(),
+                "rejected_by": "admin"
+            })
+            
             await query.edit_message_text(
                 f"❌ Rejected deposit for {record.get('name', 'User')}.\n"
                 f"Ref: {record.get('txnId', 'N/A')}"
@@ -979,16 +895,12 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         if action == "approve":
-            record_ref = withdrawals_ref.child(key)
-            claimed = record_ref.transaction(
-                lambda current: {**current, "status": "approved", "approved_at": datetime.now().isoformat(), "approved_by": "admin"}
-                if current and current.get("status") == "pending"
-                else current
-            )
-            if not claimed or claimed.get("status") != "approved":
-                await query.edit_message_text("ℹ️ Already handled (double tap or duplicate action ignored).")
-                return
-
+            withdrawals_ref.child(key).update({
+                "status": "approved",
+                "approved_at": datetime.now().isoformat(),
+                "approved_by": "admin"
+            })
+            
             await query.edit_message_text(
                 f"✅ Approved withdrawal of {record.get('amount', 0):.2f} ብር for {record.get('name')}.\n"
                 f"📞 Send to: {record.get('phone')}\n"
@@ -1009,20 +921,10 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user_id = str(record["by"])
             amount = record.get("amount", 0)
             name = record.get("name", "User")
-
-            record_ref = withdrawals_ref.child(key)
-            claimed = record_ref.transaction(
-                lambda current: {**current, "status": "processing"}
-                if current and current.get("status") == "pending"
-                else current
-            )
-            if not claimed or claimed.get("status") != "processing":
-                await query.edit_message_text("ℹ️ Already handled (double tap or duplicate action ignored).")
-                return
-
+            
             success, err = _refund_withdrawal(user_id, amount)
             
-            record_ref.update({
+            withdrawals_ref.child(key).update({
                 "status": "rejected",
                 "rejected_at": datetime.now().isoformat(),
                 "rejected_by": "admin",
@@ -1603,10 +1505,8 @@ def _daily_report_scheduler(loop):
 ROUND_CARD_SELECTION_SECONDS = 45  # must match CARD_SELECTION_SECONDS in index.html
 ROUND_CALL_INTERVAL_SECONDS = 3    # must match the 3000ms cadence in index.html
 
-# Play 10 and Play 20 are separate games -- separate round, card selection,
-# caller and prize pool -- each living under its own "room_<stake>" path
-# (see roomRef() in index.html). Must match the stakes chooseStake() offers.
-GAME_STAKES = [10, 20]
+_last_handled_round_id = None
+_current_round_calling = False
 
 
 def _compute_and_publish_prize_pool(room_ref):
@@ -1630,20 +1530,6 @@ def _compute_and_publish_prize_pool(room_ref):
     room_ref.child("prizePool").transaction(txn)
 
 
-def _firebase_now_ms(room_ref) -> int:
-    """Returns Firebase Realtime Database's own current server time (ms),
-    by writing a server-timestamp sentinel to a scratch path and reading
-    back what the server stamped it with. Clients compute their round
-    countdowns against this same Firebase server clock (via a client-side
-    offset probe) -- comparing against it here too, instead of against this
-    machine's own system clock, means a few seconds of clock drift between
-    this server and Firebase can no longer make calling start early/late or
-    make a round look stale/not-stale incorrectly."""
-    probe_ref = room_ref.child("_serverTimeProbe")
-    probe_ref.set({".sv": "timestamp"})
-    return int(probe_ref.get() or int(time.time() * 1000))
-
-
 def _call_next_number(room_ref):
     """Adds one new unique number (1-75) to room/calledNumbers via a
     Firebase transaction -- same algorithm attemptCallNextNumber() used
@@ -1664,249 +1550,19 @@ def _call_next_number(room_ref):
 
     result = room_ref.child("calledNumbers").transaction(txn)
     if result is not None:
-        # Written as a server-timestamp sentinel (not this machine's own
-        # time.time()) so clients' staleness checks compare against the
-        # same Firebase server clock they're already synced to.
-        room_ref.child("lastCallAt").set({".sv": "timestamp"})
+        room_ref.child("lastCallAt").set(int(time.time() * 1000))
 
 
-def _card_has_win(matrix, called_set):
-    """Returns the winning pattern (list of [row, col] pairs) for this
-    card's matrix given the numbers called so far, or None if it hasn't
-    won yet. Mirrors getWinningPattern()/checkGlobalWinConditions() in
-    index.html exactly -- row, column, either diagonal, or four corners --
-    so this credits a card if and only if the UI would show it as a
-    winner, just checked here against data no player's own device can
-    edit, instead of trusting whatever a browser claims."""
-    def hit(v):
-        return v == "FREE" or v in called_set
-
-    for r in range(5):
-        if all(hit(matrix[r][c]) for c in range(5)):
-            return [[r, c] for c in range(5)]
-    for c in range(5):
-        if all(hit(matrix[r][c]) for r in range(5)):
-            return [[r, c] for r in range(5)]
-    if all(hit(matrix[i][i]) for i in range(5)):
-        return [[i, i] for i in range(5)]
-    if all(hit(matrix[i][4 - i]) for i in range(5)):
-        return [[i, 4 - i] for i in range(5)]
-    corners = [(0, 0), (0, 4), (4, 0), (4, 4)]
-    if all(hit(matrix[r][c]) for r, c in corners):
-        return [[r, c] for r, c in corners]
-    return None
-
-
-def _check_all_cards_for_win(room_ref, called_set):
-    """Reads every claimed card straight from room/takenCards (the same
-    place claimCardInFirebase() writes each card's real matrix to) and
-    independently re-checks each one against the numbers actually called
-    so far. This -- not anything a browser reports -- is what now decides
-    who has won."""
-    taken = room_ref.child("takenCards").get() or {}
-    winners = []
-    for card_num_str, entry in taken.items():
-        if not isinstance(entry, dict):
-            continue
-        matrix = entry.get("matrix")
-        if not matrix:
-            continue
-        pattern = _card_has_win(matrix, called_set)
-        if pattern:
-            winners.append({
-                "cardNum": int(card_num_str),
-                "by": entry.get("by"),
-                "name": entry.get("name"),
-                "pattern": pattern,
-            })
-    return winners
-
-
-def _credit_bingo_payout(user_id, payout_key, amount, num_winners):
-    """Idempotently pays a bingo win straight into wallet.main inside one
-    Firebase Admin SDK transaction. Previously index.html's own browser
-    code did this exact write directly from the client -- meaning anyone
-    with devtools/the Firebase JS SDK could call that same transaction
-    themselves and credit their own wallet an arbitrary amount without
-    ever winning a round. Now that this bot (using the Admin SDK, which
-    the security rules can restrict to server-only) is the only thing
-    that ever increases wallet.main for a game win, and only ever does so
-    after _card_has_win() above independently confirmed a real win, that
-    path is closed. bingoPayouts[payout_key] keeps this idempotent -- a
-    restart or a re-run of the same round can never pay the same user
-    twice for it."""
-    if not user_id or amount <= 0:
-        return
-    wallet_ref = _wallet_ref(str(user_id))
-
-    def txn(current):
-        if current is None:
-            current = {"main": 0, "play": 0, "deposited": 0}
-        current = dict(current)
-        payouts = dict(current.get("bingoPayouts") or {})
-        if payout_key in payouts:
-            return current  # already paid out for this round -- no-op
-        current["main"] = current.get("main", 0) + amount
-        payouts[payout_key] = {
-            "amount": amount,
-            "winners": num_winners,
-            "ts": int(time.time() * 1000),
-        }
-        current["bingoPayouts"] = payouts
-        return current
-
+def _run_one_round(room_ref, round_id):
+    """Blocks this background thread for the lifetime of one round: waits
+    out the shared card-selection window, publishes the prize pool once,
+    then calls numbers every few seconds until 75 numbers are out or a
+    winner ends the round (room/roundEnded, set client-side as before)."""
+    global _current_round_calling
+    _current_round_calling = True
     try:
-        wallet_ref.transaction(txn)
-    except Exception as e:
-        log.error(f"Bingo payout credit failed for {user_id}: {e}")
-
-
-def _finalize_round_and_payout(room_ref, stake, round_id, winners):
-    """The single place that ends a round and pays its winners, now that
-    winner detection lives here instead of in every player's browser.
-    Only ever called from _run_one_round's own loop, which
-    _round_watcher_loop already runs at most once at a time per stake --
-    so there's no other caller to race against, unlike the old client-side
-    finalizeRoundWinners() which needed its own cross-device lock."""
-    updates = {}
-    for w in winners:
-        updates[str(w["cardNum"])] = {
-            "by": w.get("by"),
-            "name": w.get("name"),
-            "pattern": w.get("pattern") or [],
-        }
-    room_ref.child("winnerCards").set(updates)
-
-    prize_pool = float(room_ref.child("prizePool").get() or 0)
-    sorted_winners = sorted(winners, key=lambda w: w["cardNum"])
-    num_winners = len(sorted_winners)
-    prize_cents = round(prize_pool * 100)
-    base_cents = prize_cents // num_winners if num_winners else 0
-    remainder_cents = prize_cents - base_cents * num_winners if num_winners else 0
-
-    payout_key = f"{stake}_{round_id}"
-    for idx, w in enumerate(sorted_winners):
-        share_cents = base_cents + (1 if idx < remainder_cents else 0)
-        _credit_bingo_payout(w.get("by"), payout_key, share_cents / 100.0, num_winners)
-
-    # Set last so every listening client's roundEnded flip only ever fires
-    # after winnerCards is written AND every winner's wallet is already
-    # credited -- the popup/history read in subscribeRoundEnd() never has
-    # to wait for or race the payout.
-    room_ref.child("roundEnded").set(True)
-
-
-def _claim_round_for_calling(room_ref, round_id) -> bool:
-    """Cross-process lock: atomically claims round_id for number-calling
-    via a Firebase transaction, so only ONE bot process ever actually
-    runs _run_one_round for it -- even if more than one instance of this
-    bot is alive at once (e.g. a stale process left running during a
-    Render redeploy overlap, the exact scenario behind the
-    "Conflict: terminated by other getUpdates request" errors).
-
-    Without this, _round_watcher_loop's last_handled_round_id/round_calling
-    flags are per-PROCESS only -- invisible to any other instance. A second
-    process would see the same round_id as "new to me" and call
-    _run_one_round itself, whose very first action wipes
-    calledNumbers/winnerCards/roundEnded back to None. If that happens right
-    after the real instance already found a winner and set those fields,
-    the just-announced win is erased before players ever see it -- the
-    round just silently resets instead. Keying the lock off round_id itself
-    (rather than clearing it between rounds) means it only ever blocks a
-    duplicate attempt at the SAME round; the next real round_id is a
-    different value and claims cleanly."""
-    claim_ref = room_ref.child("callerClaimedRoundId")
-    abort_holder = {"already_claimed": False}
-
-    def claim(current):
-        if current == round_id:
-            abort_holder["already_claimed"] = True
-            return current  # no-op -- another process already owns this round
-        return round_id
-
-    try:
-        result = claim_ref.transaction(claim)
-        if result is None:
-            return False
-        return not abort_holder["already_claimed"]
-    except Exception as e:
-        log.error(f"Round-claim transaction failed for round {round_id} (stake?): {e}")
-        return False
-
-
-def _run_one_round(room_ref, round_id, stake):
-    """Blocks the calling thread for the lifetime of one round: clears out
-    the previous round's leftover state, waits out the shared
-    card-selection window, publishes the prize pool once, then calls
-    numbers every few seconds -- checking after each one whether any card
-    has actually won -- until either a real winner is found and paid
-    (_finalize_round_and_payout) or all 75 numbers are out with no
-    winner."""
-    try:
-        # Clear out everything left over from the previous round in this
-        # room. This used to be done client-side, by whichever player's
-        # device happened to win the "start the round" race -- including
-        # calledNumbers/winnerCards/roundEnded/prizePool, which only the
-        # bot is now allowed to write at all (see the Firebase rules that
-        # go with this file). Left undone, a stale roundEnded: true from
-        # the last round would make this new round look already finished
-        # the instant it starts. takenCards/userCardCount/caller are
-        # included here too so no per-round state is split between two
-        # writers -- the bot alone owns every one of these for a round's
-        # entire lifecycle now.
-        # takenCards/userCardCount used to be blindly wiped to None here,
-        # the instant this process noticed the new round_id. That's safe
-        # only if the wipe always lands BEFORE any player can have tapped
-        # a card for this new round -- but this loop only polls every
-        # 0.3s, and can be much later than that after a slow Render
-        # cold-start or a redeploy overlap. A player who picked a card in
-        # that window had it silently deleted the moment the bot caught
-        # up, with no error shown -- their card just vanished ("blank")
-        # once the game screen opened. Every claim written by
-        # claimCardInFirebase() now stamps its own roundId, so instead of
-        # wiping everything unconditionally, only leftover entries from a
-        # DIFFERENT (older) round are removed -- any card already claimed
-        # for THIS round_id survives, and userCardCount is recomputed from
-        # what's actually kept instead of being reset to zero underneath
-        # players who already hold a card.
-        existing_taken = room_ref.child("takenCards").get() or {}
-        stale_cells = [
-            cell for cell, entry in existing_taken.items()
-            if not (isinstance(entry, dict) and entry.get("roundId") == round_id)
-        ]
-        kept_taken = {
-            cell: entry for cell, entry in existing_taken.items()
-            if cell not in stale_cells
-        }
-        recomputed_counts = {}
-        for entry in kept_taken.values():
-            uid = entry.get("by")
-            if uid:
-                recomputed_counts[uid] = recomputed_counts.get(uid, 0) + 1
-
-        updates = {("takenCards/" + cell): None for cell in stale_cells}
-        updates["userCardCount"] = recomputed_counts or None
-        updates.update({
-            "caller": None,
-            "calledNumbers": None,
-            "winnerCards": None,
-            "roundEnded": None,
-            "prizePool": None,
-            "lastCallAt": None,
-            "roundFinalizing": None,
-        })
-        room_ref.update(updates)
-
-        # Prefer the exact deadline clients are already counting down to
-        # (written once, in Firebase server time, by whoever's device
-        # started the round) over recomputing it from round_id -- and
-        # measure "now" from Firebase's own clock too, so this doesn't
-        # depend on this server's system clock matching Firebase's at all.
-        deadline_ms = room_ref.child("cardSelectionEndTime").get()
-        if not deadline_ms:
-            deadline_ms = round_id + ROUND_CARD_SELECTION_SECONDS * 1000
-        now_ms = _firebase_now_ms(room_ref)
-        remaining_s = (deadline_ms - now_ms) / 1000.0
+        elapsed_ms = time.time() * 1000 - round_id
+        remaining_s = (ROUND_CARD_SELECTION_SECONDS * 1000 - elapsed_ms) / 1000.0
         if remaining_s > 0:
             time.sleep(remaining_s + 0.5)  # small buffer past the client deadline
 
@@ -1916,73 +1572,35 @@ def _run_one_round(room_ref, round_id, stake):
         _compute_and_publish_prize_pool(room_ref)
 
         while True:
-            loop_start = time.time()
             if room_ref.child("roundEnded").get() is True:
                 return
             called = room_ref.child("calledNumbers").get() or []
-            called_set = set(called)
-
-            # Server-authoritative win check: every claimed card is
-            # re-verified here against the numbers actually written to
-            # Firebase, independent of anything any player's device
-            # reports. See _check_all_cards_for_win/_card_has_win.
-            winners = _check_all_cards_for_win(room_ref, called_set)
-            if winners:
-                _finalize_round_and_payout(room_ref, stake, round_id, winners)
-                return
-
             if len(called) >= 75:
-                # All 75 numbers are out and no card ever won -- close the
-                # round out explicitly instead of just returning, so every
-                # listening client's roundEnded/winnerCards listener fires
-                # and resets them (otherwise the room stays stuck showing
-                # the finished round -- stale Derash/Called -- forever).
-                room_ref.child("winnerCards").set({})
-                room_ref.child("roundEnded").set(True)
                 return
             _call_next_number(room_ref)
-            # Each Firebase read/transaction above takes real network time
-            # (often a few hundred ms, sometimes more under load). Sleeping
-            # a full ROUND_CALL_INTERVAL_SECONDS on top of that -- instead of
-            # accounting for time already spent -- made the gap between
-            # calls slowly grow past 3s over the course of a round. Sleeping
-            # only for what's left of the interval keeps calls landing on a
-            # steady ~3s cadence regardless of network latency.
-            elapsed = time.time() - loop_start
-            time.sleep(max(0.0, ROUND_CALL_INTERVAL_SECONDS - elapsed))
+            time.sleep(ROUND_CALL_INTERVAL_SECONDS)
     except Exception as e:
         log.error(f"Round caller failed for round {round_id}: {e}")
+    finally:
+        _current_round_calling = False
 
 
-def _round_watcher_loop(stake):
-    """Runs for the lifetime of the process -- one instance per stake,
-    started in on_startup() so Play 10 and Play 20 run as fully
-    independent, concurrent games. Polls room_<stake>/roundId and starts a
-    new calling cycle whenever a new round begins for that stake."""
-    room_ref = db.reference(f"room_{stake}")
-    last_handled_round_id = None
-    round_calling = False
+def _round_watcher_loop():
+    """Runs for the lifetime of the process. Polls room/roundId and starts
+    a new calling cycle whenever a new round begins -- replacing the old
+    per-player 'elected caller' scheme entirely."""
+    global _last_handled_round_id
+    room_ref = db.reference("room")
     while True:
         try:
-            if not round_calling:
+            if not _current_round_calling:
                 round_id = room_ref.child("roundId").get()
-                if round_id and round_id != last_handled_round_id:
-                    last_handled_round_id = round_id
-                    if _claim_round_for_calling(room_ref, round_id):
-                        round_calling = True
-                        try:
-                            _run_one_round(room_ref, round_id, stake)
-                        finally:
-                            round_calling = False
-                    else:
-                        log.info(
-                            f"Round {round_id} (stake {stake}) is already claimed by "
-                            "another running instance -- skipping to avoid double-calling "
-                            "or wiping its result."
-                        )
+                if round_id and round_id != _last_handled_round_id:
+                    _last_handled_round_id = round_id
+                    _run_one_round(room_ref, round_id)
         except Exception as e:
-            log.error(f"Round watcher loop error (stake {stake}): {e}")
-        time.sleep(0.3)
+            log.error(f"Round watcher loop error: {e}")
+        time.sleep(1)
 
 
 # ============================================================
@@ -2005,9 +1623,8 @@ async def on_startup(application):
     threading.Thread(target=_daily_report_scheduler, args=(main_loop,), daemon=True).start()
     log.info(f"Daily report scheduler started (sends at {REPORT_HOUR_UTC}:00 UTC).")
 
-    for stake in GAME_STAKES:
-        threading.Thread(target=_round_watcher_loop, args=(stake,), daemon=True).start()
-    log.info(f"Bingo round callers started for stakes {GAME_STAKES} (server-side number calling).")
+    threading.Thread(target=_round_watcher_loop, daemon=True).start()
+    log.info("Bingo round caller started (server-side number calling).")
 
 
 def main():
