@@ -1616,10 +1616,8 @@ def _compute_and_publish_prize_pool(room_ref):
     taken = room_ref.child("takenCards").get() or {}
     pool_base = 0.0
     for card in taken.values():
-        if not isinstance(card, dict) or not card.get("paid"):
-            continue  # stake not actually deducted yet (or deduction failed) - don't count it
         try:
-            pool_base += float(card.get("stake", 0) or 0)
+            pool_base += float((card or {}).get("stake", 0) or 0)
         except (TypeError, ValueError):
             pass
     pool = pool_base * 0.8
@@ -1708,7 +1706,7 @@ def _check_all_cards_for_win(room_ref, called_set):
     taken = room_ref.child("takenCards").get() or {}
     winners = []
     for card_num_str, entry in taken.items():
-        if not isinstance(entry, dict) or not entry.get("paid"):
+        if not isinstance(entry, dict):
             continue
         matrix = entry.get("matrix")
         if not matrix:
@@ -1798,28 +1796,42 @@ def _finalize_round_and_payout(room_ref, stake, round_id, winners):
     room_ref.child("roundEnded").set(True)
 
 
-def _claim_round_init(room_ref, round_id):
-    """Atomically claims responsibility for (re)initializing this round.
+def _claim_round_for_calling(room_ref, round_id) -> bool:
+    """Cross-process lock: atomically claims round_id for number-calling
+    via a Firebase transaction, so only ONE bot process ever actually
+    runs _run_one_round for it -- even if more than one instance of this
+    bot is alive at once (e.g. a stale process left running during a
+    Render redeploy overlap, the exact scenario behind the
+    "Conflict: terminated by other getUpdates request" errors).
 
-    The claim lives in Firebase itself, not in _round_watcher_loop's
-    in-process `last_handled_round_id` variable -- so if this process
-    restarts mid-round (Render redeploy, crash, cold-start after
-    sleeping) and picks the same round_id back up on its next poll, it
-    will see the round was already initialized and will NOT wipe
-    takenCards/userCardCount again, which would otherwise erase cards
-    players had already selected while this process was down. Returns
-    True only for the call that actually wins the claim (i.e. this
-    round hasn't been initialized by anyone yet)."""
-    won = {"value": False}
+    Without this, _round_watcher_loop's last_handled_round_id/round_calling
+    flags are per-PROCESS only -- invisible to any other instance. A second
+    process would see the same round_id as "new to me" and call
+    _run_one_round itself, whose very first action wipes
+    calledNumbers/winnerCards/roundEnded back to None. If that happens right
+    after the real instance already found a winner and set those fields,
+    the just-announced win is erased before players ever see it -- the
+    round just silently resets instead. Keying the lock off round_id itself
+    (rather than clearing it between rounds) means it only ever blocks a
+    duplicate attempt at the SAME round; the next real round_id is a
+    different value and claims cleanly."""
+    claim_ref = room_ref.child("callerClaimedRoundId")
+    abort_holder = {"already_claimed": False}
 
-    def txn(current):
+    def claim(current):
         if current == round_id:
-            return current  # already claimed for this round -- no-op
-        won["value"] = True
+            abort_holder["already_claimed"] = True
+            return current  # no-op -- another process already owns this round
         return round_id
 
-    room_ref.child("roundInitializedFor").transaction(txn)
-    return won["value"]
+    try:
+        result = claim_ref.transaction(claim)
+        if result is None:
+            return False
+        return not abort_holder["already_claimed"]
+    except Exception as e:
+        log.error(f"Round-claim transaction failed for round {round_id} (stake?): {e}")
+        return False
 
 
 def _run_one_round(room_ref, round_id, stake):
@@ -1842,23 +1854,48 @@ def _run_one_round(room_ref, round_id, stake):
         # included here too so no per-round state is split between two
         # writers -- the bot alone owns every one of these for a round's
         # entire lifecycle now.
-        #
-        # Guarded by _claim_round_init() so this destructive reset only
-        # ever runs once per round_id, even across a process restart --
-        # otherwise a restart mid-selection would wipe cards players had
-        # already picked for this exact round.
-        if _claim_round_init(room_ref, round_id):
-            room_ref.update({
-                "takenCards": None,
-                "userCardCount": None,
-                "caller": None,
-                "calledNumbers": None,
-                "winnerCards": None,
-                "roundEnded": None,
-                "prizePool": None,
-                "lastCallAt": None,
-                "roundFinalizing": None,
-            })
+        # takenCards/userCardCount used to be blindly wiped to None here,
+        # the instant this process noticed the new round_id. That's safe
+        # only if the wipe always lands BEFORE any player can have tapped
+        # a card for this new round -- but this loop only polls every
+        # 0.3s, and can be much later than that after a slow Render
+        # cold-start or a redeploy overlap. A player who picked a card in
+        # that window had it silently deleted the moment the bot caught
+        # up, with no error shown -- their card just vanished ("blank")
+        # once the game screen opened. Every claim written by
+        # claimCardInFirebase() now stamps its own roundId, so instead of
+        # wiping everything unconditionally, only leftover entries from a
+        # DIFFERENT (older) round are removed -- any card already claimed
+        # for THIS round_id survives, and userCardCount is recomputed from
+        # what's actually kept instead of being reset to zero underneath
+        # players who already hold a card.
+        existing_taken = room_ref.child("takenCards").get() or {}
+        stale_cells = [
+            cell for cell, entry in existing_taken.items()
+            if not (isinstance(entry, dict) and entry.get("roundId") == round_id)
+        ]
+        kept_taken = {
+            cell: entry for cell, entry in existing_taken.items()
+            if cell not in stale_cells
+        }
+        recomputed_counts = {}
+        for entry in kept_taken.values():
+            uid = entry.get("by")
+            if uid:
+                recomputed_counts[uid] = recomputed_counts.get(uid, 0) + 1
+
+        updates = {("takenCards/" + cell): None for cell in stale_cells}
+        updates["userCardCount"] = recomputed_counts or None
+        updates.update({
+            "caller": None,
+            "calledNumbers": None,
+            "winnerCards": None,
+            "roundEnded": None,
+            "prizePool": None,
+            "lastCallAt": None,
+            "roundFinalizing": None,
+        })
+        room_ref.update(updates)
 
         # Prefer the exact deadline clients are already counting down to
         # (written once, in Firebase server time, by whoever's device
@@ -1931,11 +1968,18 @@ def _round_watcher_loop(stake):
                 round_id = room_ref.child("roundId").get()
                 if round_id and round_id != last_handled_round_id:
                     last_handled_round_id = round_id
-                    round_calling = True
-                    try:
-                        _run_one_round(room_ref, round_id, stake)
-                    finally:
-                        round_calling = False
+                    if _claim_round_for_calling(room_ref, round_id):
+                        round_calling = True
+                        try:
+                            _run_one_round(room_ref, round_id, stake)
+                        finally:
+                            round_calling = False
+                    else:
+                        log.info(
+                            f"Round {round_id} (stake {stake}) is already claimed by "
+                            "another running instance -- skipping to avoid double-calling "
+                            "or wiping its result."
+                        )
         except Exception as e:
             log.error(f"Round watcher loop error (stake {stake}): {e}")
         time.sleep(0.3)
