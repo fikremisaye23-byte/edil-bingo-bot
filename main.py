@@ -1452,18 +1452,16 @@ ROUND_CALL_INTERVAL_SECONDS = 3    # must match the 3000ms cadence in index.html
 GAME_STAKES = [10, 20]
 
 
-def _compute_and_publish_prize_pool(room_ref):
-    """Reads room/takenCards, computes 80% of total stake, writes
-    room/prizePool if it hasn't already been set for this round --
-    mirrors the old client-side acquireRoundCaller() logic exactly."""
+def _compute_and_publish_prize_pool(room_ref, stake):
+    """Reads room/takenCards, computes 80% of (number of taken cards × the
+    room's own fixed stake), writes room/prizePool if it hasn't already
+    been set for this round. Uses the room's own known stake -- not the
+    "stake" field stored on each card, which is written by the same
+    client-side code a tampered browser could also tamper with -- so a
+    manipulated takenCards entry can no longer inflate the announced
+    pool."""
     taken = room_ref.child("takenCards").get() or {}
-    pool_base = 0.0
-    for card in taken.values():
-        try:
-            pool_base += float((card or {}).get("stake", 0) or 0)
-        except (TypeError, ValueError):
-            pass
-    pool = pool_base * 0.8
+    pool = len(taken) * stake * 0.8
 
     def txn(current):
         if current and current > 0:
@@ -1471,6 +1469,81 @@ def _compute_and_publish_prize_pool(room_ref):
         return pool
 
     room_ref.child("prizePool").transaction(txn)
+
+
+def _deduct_stake_for_card(user_id, amount, deduction_round_key):
+    """Mirrors index.html's proceedWithDeduction() wallet transaction
+    exactly (play-wallet drawn down first, main covers the remainder,
+    deposited-fraction bookkeeping preserved) using the same
+    lastStakeDeductionRound idempotency key on users/{uid}/wallet that the
+    client already writes. Whichever side -- this server-side safety net
+    or the player's own browser -- reaches Firebase first for a given
+    round wins that transaction; the other sees the key already set and
+    leaves the wallet untouched, so a card can never be paid for twice.
+    This exists to catch the case where a player's browser skipped or was
+    tampered to skip its own deduction -- not to replace it."""
+    wallet_ref = _wallet_ref(user_id)
+    outcome = {"paid": False, "insufficient": False}
+
+    def txn(current):
+        current = dict(current) if current else {"main": 0, "play": 0, "deposited": 0}
+        if current.get("lastStakeDeductionRound") == deduction_round_key:
+            outcome["paid"] = True
+            return current
+        play = current.get("play", 0) or 0
+        main = current.get("main", 0) or 0
+        deposited = current.get("deposited", 0) or 0
+        if (play + main) < amount:
+            outcome["insufficient"] = True
+            return current  # abort -- leave the wallet untouched
+        before_play = play
+        from_play = min(play, amount)
+        from_main = amount - from_play
+        play -= from_play
+        main -= from_main
+        real_fraction = min(1, deposited / before_play) if before_play > 0 else 0
+        deposited = max(0, deposited - (from_play * real_fraction))
+        current["play"] = play
+        current["main"] = main
+        current["deposited"] = deposited
+        current["lastStakeDeductionRound"] = deduction_round_key
+        outcome["paid"] = True
+        return current
+
+    try:
+        wallet_ref.transaction(txn)
+    except Exception as e:
+        log.error(f"Server-side stake deduction failed for {user_id}: {e}")
+    return outcome
+
+
+def _deduct_stakes_for_round(room_ref, stake, round_id):
+    """Server-side safety net for stake collection: runs once per round,
+    right as calling begins, and charges every taken card's owner the
+    room's fixed stake per card they hold -- independently of whether
+    their own browser already did (or was tampered to skip) its own
+    deduction. Shares the exact lastStakeDeductionRound idempotency key
+    with the client's proceedWithDeduction(), so a player who was already
+    correctly charged client-side (the normal case) is never charged
+    again here; this only catches the case where that never happened."""
+    taken = room_ref.child("takenCards").get() or {}
+    deduction_round_key = f"{stake}_{round_id}"
+
+    cards_per_user = {}
+    for card in taken.values():
+        user_id = (card or {}).get("by")
+        if user_id:
+            cards_per_user[user_id] = cards_per_user.get(user_id, 0) + 1
+
+    for user_id, card_count in cards_per_user.items():
+        outcome = _deduct_stake_for_card(user_id, card_count * stake, deduction_round_key)
+        if outcome["insufficient"]:
+            log.warning(
+                f"Player {user_id} held {card_count} card(s) in room_{stake} "
+                f"round {round_id} without enough combined balance -- their "
+                f"own client-side deduction may have failed too; flagged, "
+                f"not removed from the round."
+            )
 
 
 def _firebase_now_ms(room_ref) -> int:
@@ -1536,7 +1609,55 @@ def _matrix_has_win(matrix, called_set):
     return False
 
 
-def _check_and_finalize_winners(room_ref):
+def _credit_payout(user_id, prize, payout_key, num_winners):
+    """Mirrors index.html's own payout-crediting transaction (line ~1372)
+    exactly: credits wallet.main and records bingoPayouts/{payout_key} as
+    the idempotency guard. Uses the SAME field and key format the client
+    already checks, so whichever side -- this server-side pass or the
+    winner's own browser -- reaches Firebase first for this round wins;
+    the other sees bingoPayouts[payout_key] already set and leaves the
+    wallet untouched, so nobody is ever paid twice."""
+    wallet_ref = _wallet_ref(user_id)
+
+    def txn(current):
+        current = dict(current) if current else {"main": 0, "play": 0, "deposited": 0}
+        payouts = dict(current.get("bingoPayouts") or {})
+        if payouts.get(payout_key):
+            return current  # already paid -- by this call or the client's own
+        current["main"] = (current.get("main", 0) or 0) + prize
+        payouts[payout_key] = {"amount": prize, "winners": num_winners, "ts": int(time.time() * 1000)}
+        current["bingoPayouts"] = payouts
+        return current
+
+    try:
+        wallet_ref.transaction(txn)
+    except Exception as e:
+        log.error(f"Server-side payout failed for {user_id}: {e}")
+
+
+def _distribute_payout(room_ref, stake, round_id, winners):
+    """Splits room/prizePool across winners and credits each one -- same
+    equal-split-with-remainder-to-earliest-card-number math as index.html's
+    own payout code, so a player sees the exact same amount whichever side
+    ends up crediting them first."""
+    prize_pool = room_ref.child("prizePool").get() or 0
+    payout_key = f"{stake}_{round_id}"
+    sorted_winners = sorted(winners.items(), key=lambda kv: int(kv[0]))
+    num_winners = len(sorted_winners)
+    if num_winners == 0:
+        return
+    pool_cents = round(prize_pool * 100)
+    base_cents = pool_cents // num_winners
+    remainder_cents = pool_cents - (base_cents * num_winners)
+    for idx, (_card_num_str, winner) in enumerate(sorted_winners):
+        user_id = (winner or {}).get("by")
+        if not user_id:
+            continue
+        prize_cents = base_cents + (1 if idx < remainder_cents else 0)
+        _credit_payout(user_id, prize_cents / 100.0, payout_key, num_winners)
+
+
+def _check_and_finalize_winners(room_ref, stake, round_id):
     """Independently checks every taken card against the numbers called so
     far and, if any card has a live win, atomically finalizes the round
     (winnerCards + roundEnded) -- using the exact same room/roundFinalizing
@@ -1576,6 +1697,7 @@ def _check_and_finalize_winners(room_ref):
 
     room_ref.child("winnerCards").set(winners)
     room_ref.child("roundEnded").set(True)
+    _distribute_payout(room_ref, stake, round_id, winners)
     log.info(f"Server-side winner check finalized round with {len(winners)} winner(s).")
     return True
 
@@ -1600,11 +1722,11 @@ def _finalize_no_winner(room_ref):
     return True
 
 
-def _run_one_round(room_ref, round_id):
+def _run_one_round(room_ref, round_id, stake):
     """Blocks the calling thread for the lifetime of one round: waits out
-    the shared card-selection window, publishes the prize pool once, then
-    calls numbers every few seconds until 75 numbers are out or a winner
-    ends the round (roundEnded, set client-side as before)."""
+    the shared card-selection window, publishes the prize pool and
+    collects stakes once, then calls numbers every few seconds until 75
+    numbers are out or a winner ends the round."""
     try:
         # Prefer the exact deadline clients are already counting down to
         # (written once, in Firebase server time, by whoever's device
@@ -1622,7 +1744,8 @@ def _run_one_round(room_ref, round_id):
         if room_ref.child("roundEnded").get() is True:
             return  # round already wrapped up (e.g. no cards were taken)
 
-        _compute_and_publish_prize_pool(room_ref)
+        _compute_and_publish_prize_pool(room_ref, stake)
+        _deduct_stakes_for_round(room_ref, stake, round_id)
 
         while True:
             loop_start = time.time()
@@ -1636,7 +1759,7 @@ def _run_one_round(room_ref, round_id):
             # Check independently, right after the new number lands, whether
             # any taken card now has a live win -- don't rely solely on a
             # player's own browser to report it.
-            if _check_and_finalize_winners(room_ref):
+            if _check_and_finalize_winners(room_ref, stake, round_id):
                 return
             # Each Firebase read/transaction above takes real network time
             # (often a few hundred ms, sometimes more under load). Sleeping
@@ -1667,7 +1790,7 @@ def _round_watcher_loop(stake):
                     last_handled_round_id = round_id
                     round_calling = True
                     try:
-                        _run_one_round(room_ref, round_id)
+                        _run_one_round(room_ref, round_id, stake)
                     finally:
                         round_calling = False
         except Exception as e:
