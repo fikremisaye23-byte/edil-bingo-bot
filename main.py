@@ -1774,28 +1774,46 @@ def _run_one_round(room_ref, round_id, stake):
         log.error(f"Round caller failed for round {round_id}: {e}")
 
 
-def _round_watcher_loop(stake):
-    """Runs for the lifetime of the process -- one instance per stake,
-    started in on_startup() so Play 10 and Play 20 run as fully
-    independent, concurrent games. Polls room_<stake>/roundId and starts a
-    new calling cycle whenever a new round begins for that stake."""
-    room_ref = db.reference(f"room_{stake}")
-    last_handled_round_id = None
-    round_calling = False
-    while True:
+_round_watcher_state: Dict[int, Dict[str, Any]] = {}
+
+
+def _handle_round_id_event(stake, room_ref, event):
+    """Fired by the Firebase realtime listener (see _start_round_watcher)
+    whenever room_<stake>/roundId actually changes -- not on a timer, so
+    this generates a Firebase read only when a round genuinely starts,
+    instead of every second forever."""
+    state = _round_watcher_state[stake]
+    round_id = event.data
+    if not round_id or round_id == state["last_handled_round_id"] or state["round_calling"]:
+        return
+    state["last_handled_round_id"] = round_id
+    state["round_calling"] = True
+
+    def _run():
         try:
-            if not round_calling:
-                round_id = room_ref.child("roundId").get()
-                if round_id and round_id != last_handled_round_id:
-                    last_handled_round_id = round_id
-                    round_calling = True
-                    try:
-                        _run_one_round(room_ref, round_id, stake)
-                    finally:
-                        round_calling = False
+            _run_one_round(room_ref, round_id, stake)
         except Exception as e:
-            log.error(f"Round watcher loop error (stake {stake}): {e}")
-        time.sleep(1)
+            log.error(f"Round watcher error (stake {stake}): {e}")
+        finally:
+            state["round_calling"] = False
+
+    # Run the (multi-minute, blocking) round on its own thread so the
+    # realtime listener's connection stays free to keep receiving events.
+    threading.Thread(target=_run, daemon=True).start()
+
+
+def _start_round_watcher(stake):
+    """One persistent Firebase realtime listener (SSE) per stake, started
+    in on_startup() so Play 10 and Play 20 run as fully independent,
+    concurrent games. Replaces the old once-a-second polling loop --
+    which was making ~172,800 Firebase requests/day per stake (the
+    dominant source of Render's "Service-Initiated" outbound bandwidth,
+    confirmed via the Render dashboard's Free Usage breakdown) -- with a
+    single long-lived connection that only carries data when roundId
+    actually changes."""
+    room_ref = db.reference(f"room_{stake}")
+    _round_watcher_state[stake] = {"last_handled_round_id": None, "round_calling": False}
+    room_ref.child("roundId").listen(lambda event: _handle_round_id_event(stake, room_ref, event))
 
 
 # ============================================================
@@ -1819,8 +1837,8 @@ async def on_startup(application):
     log.info(f"Daily report scheduler started (sends at {REPORT_HOUR_UTC}:00 UTC).")
 
     for stake in GAME_STAKES:
-        threading.Thread(target=_round_watcher_loop, args=(stake,), daemon=True).start()
-    log.info(f"Bingo round callers started for stakes {GAME_STAKES} (server-side number calling).")
+        _start_round_watcher(stake)
+    log.info(f"Bingo round callers started for stakes {GAME_STAKES} (realtime listener, no polling).")
 
 
 def main():
